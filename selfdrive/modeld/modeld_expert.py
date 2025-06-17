@@ -104,16 +104,15 @@ def resample_xy_to_t(xp: np.ndarray,
     return xp_r, yp_r
 
 # ────── load reference route ───────────────────────────────────────────────
-route_lats, route_lons, route_d_cur = [], [], []
+route_lats, route_lons = [], []
 if args.route.suffix == ".csv":
     with args.route.open() as f:
         rdr = csv.DictReader(f)
         for row in rdr:
             lat = row.get("lat") or row.get("latitude")
             lon = row.get("lon") or row.get("longitude")
-            dcur = row.get("desired_curvature_radpm")
             if lat and lon:
-                route_lats.append(float(lat)); route_lons.append(float(lon)) ;route_d_cur.append(float(dcur))
+                route_lats.append(float(lat)); route_lons.append(float(lon))
 else:  # rlog preload
     try:
         from tools.lib.logreader import LogReader
@@ -198,6 +197,53 @@ def b(a):
         return 0.1 * np.exp(-k * (16 - a)**p)
     else:
         return 0
+from typing import Dict
+def join_policy_outputs(
+        heads: Dict[str, np.ndarray],
+        slices: Dict[str, slice],
+) -> np.ndarray:
+    """
+    Reverse of `slice_outputs`.  Works with negative starts (e.g. pad = -2).
+    Returns shape (1, N).
+    """
+    # 1 ── total length ------------------------------------------------------
+    pos_stop_max  = 0        # largest positive stop we see
+    tail_required = 0        # how many extra elements negative slices need
+
+    for k, sl in slices.items():
+        if k not in heads:          # optional head not present
+            continue
+        size = heads[k].size
+
+        start = 0 if sl.start is None else sl.start
+        stop  = sl.stop
+
+        if start >= 0:
+            pos_stop_max = max(pos_stop_max, start + size)
+        else:                       # negative start ⇒ counts from the end
+            # example: start = -2, size = 2  →  need 2 elems of tail
+            tail_required = max(tail_required, -start)
+
+        if stop and stop > 0:       # rare case: slice(-3, -1)
+            pos_stop_max = max(pos_stop_max, stop)
+
+    flat_len = pos_stop_max + tail_required
+
+    # 2 ── allocate ---------------------------------------------------------
+    sample = next(iter(heads.values()))
+    flat   = np.empty(flat_len, dtype=sample.dtype)
+
+    # 3 ── fill -------------------------------------------------------------
+    for k, sl in slices.items():
+        if k not in heads:
+            continue
+        head  = heads[k].ravel()
+        start = 0 if sl.start is None else sl.start
+        if start < 0:
+            start = flat_len + start      # convert to absolute index
+        flat[start:start + head.size] = head
+
+    return flat[np.newaxis, :]            # add batch dim
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float,distance:float) -> log.ModelDataV2.Action:
@@ -207,8 +253,9 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                                      ModelConstants.T_IDXS,
                                                      action_t=long_action_t)
     desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
-    desired_curvature = model_output['desired_curvature'][0, 0]
-    # print(f'model_desired_curvature:{desired_curvature}')
+    desired_curvature = model_output['desired_curvature']
+
+    print(f'model_desired_curvature:{desired_curvature}')
     # desired_curvature = max(min(model_output['desired_curvature'][0, 0],0.1),-0.1)
     if distance < 20:
       desired_curvature = 0.1
@@ -420,10 +467,22 @@ class ModelState:
 
 
     self.policy_ouput = pytorch_p_outputs
+    print(self.policy_output_slices)
 
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
+    tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
+    print(tmp['desired_curvature'])
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
     # print(policy_outputs_dict.keys())
+    heads     = policy_outputs_dict
+    flat_reco = join_policy_outputs(heads, self.policy_output_slices)
+
+    print(len(self.policy_ouput[0]))
+    print(len(flat_reco[0]))
+    # assert flat_reco.shape ==
+    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(flat_reco[0].reshape(-1), self.policy_output_slices))
+    # combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
+
     return combined_outputs_dict,image_feed
 
 from collections import namedtuple
@@ -519,8 +578,8 @@ def main(demo=False):
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
   # messaging
-  # pm = PubMaster([ "modelV2","drivingModelData", "cameraOdometry"])
-  sm = SubMaster([ "modelV2","deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay","navModelDEPRECATED", "navInstruction","liveLocationKalmanDEPRECATED","gnssMeasurements"])
+  pm = PubMaster([ "modelV2","drivingModelData", "cameraOdometry"])
+  sm = SubMaster([ "deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay","navModelDEPRECATED", "navInstruction","liveLocationKalmanDEPRECATED","gnssMeasurements"])
 
   publish_state = PublishState()
   params = Params()
@@ -695,8 +754,6 @@ def main(demo=False):
     idx   = int(np.argmin(dists))
     nxt_lat = route_lats[idx:idx+args.n] if dists[idx] < args.thresh else np.array([])
     nxt_lon = route_lons[idx:idx+args.n] if dists[idx] < args.thresh else np.array([])
-    desire_cur = route_d_cur[idx+1]
-    print(f'GT_desire_cur:{desire_cur}')
 
     # planar projection
     gx,  gy  = equirect(np.asarray(live_lats), np.asarray(live_lons),
@@ -735,8 +792,8 @@ def main(demo=False):
     v_ego = max(sm["carState"].vEgo, 0.)
     # print(sm["navInstruction"])
     # print(sm["navModelDEPRECATED"])
-    # print(sm["liveLocationKalmanDEPRECATED"].positionGeodetic)
-    # print(sm["liveLocationKalmanDEPRECATED"].positionECEF)
+    print(sm["liveLocationKalmanDEPRECATED"].positionGeodetic)
+    print(sm["liveLocationKalmanDEPRECATED"].positionECEF)
     next_maneuver = {
       'type': sm["navInstruction"].maneuverType,
       'modifier': sm["navInstruction"].maneuverModifier,
@@ -745,13 +802,13 @@ def main(demo=False):
     }
 
     # Displaying the next maneuver
-    # if next_maneuver['distance'] != 0:
-    #  print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
+    if next_maneuver['distance'] != 0:
+     print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
 
     lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
-    # cloudlog.warning(f'steeringAngleDeg:{sm["carState"].steeringAngleDeg}')
-    # cloudlog.warning(f'steeringTorque:{sm["carState"].steeringTorque}')
-    # cloudlog.warning(f'steeringPressed:{sm["carState"].steeringPressed}')
+    cloudlog.warning(f'steeringAngleDeg:{sm["carState"].steeringAngleDeg}')
+    cloudlog.warning(f'steeringTorque:{sm["carState"].steeringTorque}')
+    cloudlog.warning(f'steeringPressed:{sm["carState"].steeringPressed}')
     # cloudlog.warning(f'Model_desire_curv:{sm["modelV2"].action.desiredCurvature}')
     lateral_control_params = np.array([v_ego, lat_delay], dtype=np.float32)
     if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
@@ -829,34 +886,32 @@ def main(demo=False):
       }
 
     mt1 = time.perf_counter()
-    # model_output,canvas_feed = model.run(buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
+    model_output,canvas_feed = model.run(buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
     # model_ouput = None
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
-    modelv2_send = sm["modelV2"]
-    if modelv2_send is not None:
-      # modelv2_send = messaging.new_message('modelV2')
-      # drivingdata_send = messaging.new_message('drivingModelData')
-      # posenet_send = messaging.new_message('cameraOdometry')
-      mo_dc = modelv2_send.action.desiredCurvature
-      print(f'mo_dc:{mo_dc}')
+
+    if model_output is not None:
+      modelv2_send = messaging.new_message('modelV2')
+      drivingdata_send = messaging.new_message('drivingModelData')
+      posenet_send = messaging.new_message('cameraOdometry')
+      print(model_output['desired_curvature'][0][0])
 
       # cloudlog.warning(1/model_output['desired_curvature'][0][0])
       # cloudlog.warning(model_output['lane_lines_prob'])
       # if model_output['desired_curvature'][0][0]>0.03:
       #   model_output['desired_curvature'][0][0] = 0.01
-      # action = get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, long_delay + DT_MDL, v_ego,sm["navInstruction"].maneuverDistance)
-      # prev_action = action
-      # fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
-      #                publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-      #                frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
+      action = get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, long_delay + DT_MDL, v_ego,sm["navInstruction"].maneuverDistance)
+      prev_action = action
+      fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
+                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
       # print(modelv2_send.modelV2.position)
 
-      # modelv2_send = sm["modelV2"]
-      # print(modelv2_send)
-      i = 10
-      m_x = np.array(modelv2_send.position.x)
-      m_y = np.array(modelv2_send.position.y)
+
+      i = 9
+      m_x = np.array(modelv2_send.modelV2.position.x)
+      m_y = np.array(modelv2_send.modelV2.position.y)
       x0,x1,x2 = m_x[i-1:i+2]
       y0,y1,y2 = m_y[i-1:i+2]
       dx = x2-x0
@@ -865,15 +920,12 @@ def main(demo=False):
       y_pp = (y2 - 2*y1 + y0)/h**2
       d_c = y_pp/(1+y_p**2)**1.5
       print(f"es_dc:{d_c}")
-      pos = modelv2_send.position           # shortcut
-      # print(f'pos_x:{pos.x}')
-      # print(f'pos:{pos}')
-      if len(modelv2_send.position.x):
-            fwd  = np.array(modelv2_send.position.x)        # forward (X) ➜ +Y after swap
-            left = np.array(modelv2_send.position.y)        # left (Y) ➜ +X after swap
+      if len(modelv2_send.modelV2.position.x):
+            fwd  = np.array(modelv2_send.modelV2.position.x)        # forward (X) ➜ +Y after swap
+            left = np.array(modelv2_send.modelV2.position.y)        # left (Y) ➜ +X after swap
             mdl_x, mdl_y = left, fwd
             model_line.set_data(mdl_x, mdl_y)
-      tgrid = np.array(modelv2_send.position.t)     # 33-pt grid
+      tgrid = np.array(modelv2_send.modelV2.position.t)     # 33-pt grid
 
       xp_r, yp_r = resample_xy_to_t(xp.astype(float),
                                     yp.astype(float),
@@ -901,36 +953,41 @@ def main(demo=False):
         xp_smooth = np.convolve(xp_r, kernel, mode='same')
         yp_smooth = np.convolve(yp_r, kernel, mode='same')
       pred_line .set_data(xp_smooth, yp_smooth)
+      pos = modelv2_send.modelV2.position           # shortcut
+      # print(f'pos_x:{pos.x}')
+      print(f'velocity:{modelv2_send.modelV2.velocity}')
+      print(f'acceleration:{modelv2_send.modelV2.acceleration}')
+      print(f'pos:{pos}')
 
-
-      # pos.x     = yp_smooth.astype(float).tolist()       # forward → x
-      # pos.y     = xp_smooth.astype(float).tolist()       # left    → y
+      pos.x     = yp_smooth.astype(float).tolist()       # forward → x
+      pos.y     = xp_smooth.astype(float).tolist()       # left    → y
       # pos.xStd  = [0.05] * len(tgrid)
       # pos.yStd  = [0.05] * len(tgrid)
+      print(f'new_pos:{pos}')
 
 
 
 
 
-      # desire_state = modelv2_send.modelV2.meta.desireState
-      # l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
-      # r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
-      # lane_change_prob = l_lane_change_prob + r_lane_change_prob
-      # DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
-      # modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
-      # modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
-      # drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
-      # drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
+      desire_state = modelv2_send.modelV2.meta.desireState
+      l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
+      r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
+      lane_change_prob = l_lane_change_prob + r_lane_change_prob
+      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
+      modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
+      modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
+      drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
+      drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
-      # fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
-      # # cloudlog.warning(f'modelv2_send:{modelv2_send}')
-      # # cloudlog.warning(f'drivingdata_send:{drivingdata_send}')
-      # # cloudlog.warning(f'posenet_send:{posenet_send}')
-      # x_coef = drivingdata_send.drivingModelData.path.xCoefficients  # length 5 list
-      # y_coef = drivingdata_send.drivingModelData.path.yCoefficients
-      # pm.send('modelV2', modelv2_send)
-      # pm.send('drivingModelData', drivingdata_send)
-      # pm.send('cameraOdometry', posenet_send)
+      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      # cloudlog.warning(f'modelv2_send:{modelv2_send}')
+      # cloudlog.warning(f'drivingdata_send:{drivingdata_send}')
+      # cloudlog.warning(f'posenet_send:{posenet_send}')
+      x_coef = drivingdata_send.drivingModelData.path.xCoefficients  # length 5 list
+      y_coef = drivingdata_send.drivingModelData.path.yCoefficients
+      pm.send('modelV2', modelv2_send)
+      pm.send('drivingModelData', drivingdata_send)
+      pm.send('cameraOdometry', posenet_send)
       # draw_model_path(canvas_feed['big_input_imgs'], x_coef, y_coef)
 
     #   # show the result

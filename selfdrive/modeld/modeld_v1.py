@@ -49,11 +49,12 @@ import csv
 import sys
 import argparse
 import matplotlib.pyplot as plt
+from scipy.special import softmax
 
 
 
 ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-ap.add_argument("--route",  type=Path, default="/home/adas/openpilot/kalman_track_2025-06-12_10-50-29.csv",
+ap.add_argument("--route",  type=Path, default="/home/adas/openpilot/kalman_track_CS_2025-06-17_14-38-58.csv",
                 help="reference path (.csv or .rlog.bz2)")
 ap.add_argument("--thresh", type=float, default=20,  help="match threshold (m)")
 ap.add_argument("--n",      type=int,   default=100,  help="# future points to plot")
@@ -174,7 +175,7 @@ pytorch_vision_model_loaded = onnx2pytorch.ConvertModel(model_vision).to(device)
 pytorch_vision_model_loaded.requires_grad_(False)
 pytorch_vision_model_loaded.eval()
 
-path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_aug.onnx'
+path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav.onnx'
 model_policy = onnx.load(path_to_onnx_policy_model)
 pytorch_policy_model_loaded = onnx2pytorch.ConvertModel(model_policy).to(device)
 pytorch_policy_model_loaded.requires_grad_(False)
@@ -418,6 +419,8 @@ class ModelState:
     # print(self.numpy_inputs['desire'][:])
     self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
     self.numpy_inputs['lateral_control_params'][:] = inputs['lateral_control_params']
+    self.numpy_inputs['nav_features'][:] = inputs['nav_features']
+    self.numpy_inputs['nav_instructions'][:] = inputs['nav_instructions']
     onnx_feed = {}
     image_feed = {}
     torch_feed = {}
@@ -467,20 +470,43 @@ class ModelState:
 
 
     self.policy_ouput = pytorch_p_outputs
-    print(self.policy_output_slices)
+
+    flat_policy = pytorch_p_outputs[0]        # numpy.ndarray
+
+    flat_policy = np.asarray(flat_policy).reshape(-1)   # shape (≈6 k,)
+
+    plan_raw = flat_policy[:4955].reshape(5, 991)
+    # plan_raw = pytorch_p_outputs[0:4_955].reshape(5, 991)      # (5 hyp, 991 floats each)
+    mu      = plan_raw[:, :495].reshape(5, 33, 15)      # (5, 33, 15)  -- means
+    logits  = plan_raw[:, 990]                          # (5,)         -- weights
+
+    # Pick the highest-probability hypothesis
+    best = np.argmax(softmax(logits))
+    mu_best = mu[best]                                  # shape (33, 15)
+
+    # ---------------------------------------------------------------------
+    # 2.  Extract position channels 0, 1, 2
+    # ---------------------------------------------------------------------
+    x_pos = mu_best[:, 0]           # forward (m)
+    y_pos = mu_best[:, 1]           # lateral (+left, m)
+    t_pos = mu_best[:, 13]
+    print(f'x_pos:{x_pos}')
+    print(f'y_pos:{y_pos}')
+    print(f't_pos:{t_pos}')
 
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
     tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
     print(tmp['desired_curvature'])
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
+    # print(policy_outputs_dict['plan'])
     # print(policy_outputs_dict.keys())
-    heads     = policy_outputs_dict
-    flat_reco = join_policy_outputs(heads, self.policy_output_slices)
+    # heads     = policy_outputs_dict
+    # flat_reco = join_policy_outputs(heads, self.policy_output_slices)
 
-    print(len(self.policy_ouput[0]))
-    print(len(flat_reco[0]))
+    # print(len(self.policy_ouput[0]))
+    # print(len(flat_reco[0]))
     # assert flat_reco.shape ==
-    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(flat_reco[0].reshape(-1), self.policy_output_slices))
+    # policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(flat_reco[0].reshape(-1), self.policy_output_slices))
     # combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
 
     return combined_outputs_dict,image_feed
@@ -583,6 +609,8 @@ def main(demo=False):
 
   publish_state = PublishState()
   params = Params()
+  nav_features = np.zeros(ModelConstants.NAV_FEATURE_LEN, dtype=np.float32)
+  nav_instructions = np.zeros(ModelConstants.NAV_INSTRUCTION_LEN, dtype=np.float32)
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_FREQ)
@@ -792,8 +820,8 @@ def main(demo=False):
     v_ego = max(sm["carState"].vEgo, 0.)
     # print(sm["navInstruction"])
     # print(sm["navModelDEPRECATED"])
-    print(sm["liveLocationKalmanDEPRECATED"].positionGeodetic)
-    print(sm["liveLocationKalmanDEPRECATED"].positionECEF)
+    # print(sm["liveLocationKalmanDEPRECATED"].positionGeodetic)
+    # print(sm["liveLocationKalmanDEPRECATED"].positionECEF)
     next_maneuver = {
       'type': sm["navInstruction"].maneuverType,
       'modifier': sm["navInstruction"].maneuverModifier,
@@ -802,8 +830,8 @@ def main(demo=False):
     }
 
     # Displaying the next maneuver
-    if next_maneuver['distance'] != 0:
-     print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
+    # if next_maneuver['distance'] != 0:
+    #  print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
 
     lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
     cloudlog.warning(f'steeringAngleDeg:{sm["carState"].steeringAngleDeg}')
@@ -835,33 +863,6 @@ def main(demo=False):
     R = np.array([[ cos_t, -sin_t],
                   [ sin_t,  cos_t]], dtype=np.float32)
 
-    def draw_model_path(canvas, x_coeffs, y_coeffs):
-        h, w = canvas.shape[:2]
-        bottom_center = np.array([w//2, h-1], dtype=np.float32)
-
-        # 1) Evaluate in model-frame
-        xs = polyval(t_idxs, x_coeffs)
-        ys = polyval(t_idxs, y_coeffs)
-        # print(max(xs))
-        # print(max(ys))
-        # 2) Project through homography
-        pts_model = np.stack([xs, ys, np.ones_like(xs)], axis=0)  # (3,N)
-        pts_img   = H.dot(pts_model)                              # (3,N)
-        pts_img  /= pts_img[2:3, :]                               # normalize
-        pts2d     = pts_img[:2, :].T                              # (N,2)
-
-        # 3) Shift so first point is at bottom-center
-        shift = bottom_center - pts2d[0]
-        pts2d = pts2d + shift
-
-        # 4) Rotate all points by –90° about bottom-center
-        centered = pts2d - bottom_center      # (N,2)
-        rotated  = (R @ centered.T).T         # (N,2)
-        pts2d_rot = rotated + bottom_center   # (N,2)
-
-        # 5) Draw
-        pts_int = pts2d_rot.reshape(-1,1,2).astype(np.int32)
-        cv2.polylines(canvas, [pts_int], isClosed=False, color=(0,255,0), thickness=2)
     vec_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
     if desire >= 0 and desire < ModelConstants.DESIRE_LEN:
       vec_desire[desire] = 1
@@ -879,10 +880,29 @@ def main(demo=False):
     if prepare_only:
       cloudlog.error(f"skipping model eval. Dropped {vipc_dropped_frames} frames")
 
+    nav_features[:] = 0
+    nav_instructions[:] = 0
+
+    if  sm.updated["navModelDEPRECATED"]:
+      nav_features = np.array(sm["navModelDEPRECATED"].features)
+    if  sm.updated["navInstruction"]:
+      nav_instructions[:] = 0
+      for maneuver in sm["navInstruction"].allManeuvers:
+        distance_idx = 25 + int(maneuver.distance / 20)
+        direction_idx = 0
+        if maneuver.modifier in ("left", "slight left", "sharp left"):
+          direction_idx = 1
+        if maneuver.modifier in ("right", "slight right", "sharp right"):
+          direction_idx = 2
+        if 0 <= distance_idx < 50:
+          nav_instructions[distance_idx*3 + direction_idx] = 1
+
     inputs:dict[str, np.ndarray] = {
       'desire': vec_desire,
       'traffic_convention': traffic_convention,
       'lateral_control_params': lateral_control_params,
+      'nav_features': nav_features,
+      'nav_instructions': nav_instructions,
       }
 
     mt1 = time.perf_counter()
@@ -908,7 +928,7 @@ def main(demo=False):
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
       # print(modelv2_send.modelV2.position)
 
-
+      print(modelv2_send.modelV2.position)
       i = 9
       m_x = np.array(modelv2_send.modelV2.position.x)
       m_y = np.array(modelv2_send.modelV2.position.y)
@@ -953,14 +973,14 @@ def main(demo=False):
         xp_smooth = np.convolve(xp_r, kernel, mode='same')
         yp_smooth = np.convolve(yp_r, kernel, mode='same')
       pred_line .set_data(xp_smooth, yp_smooth)
-      pos = modelv2_send.modelV2.position           # shortcut
-      # print(f'pos_x:{pos.x}')
-      print(f'pos:{pos}')
+      # pos = modelv2_send.modelV2.position           # shortcut
+      # # print(f'pos_x:{pos.x}')
+      # print(f'pos:{pos}')
 
-      pos.x     = yp_smooth.astype(float).tolist()       # forward → x
-      pos.y     = xp_smooth.astype(float).tolist()       # left    → y
-      pos.xStd  = [0.05] * len(tgrid)
-      pos.yStd  = [0.05] * len(tgrid)
+      # pos.x     = yp_smooth.astype(float).tolist()       # forward → x
+      # pos.y     = xp_smooth.astype(float).tolist()       # left    → y
+      # pos.xStd  = [0.05] * len(tgrid)
+      # pos.yStd  = [0.05] * len(tgrid)
 
 
 
