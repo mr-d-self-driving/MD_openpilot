@@ -197,6 +197,53 @@ def b(a):
         return 0.1 * np.exp(-k * (16 - a)**p)
     else:
         return 0
+from typing import Dict
+def join_policy_outputs(
+        heads: Dict[str, np.ndarray],
+        slices: Dict[str, slice],
+) -> np.ndarray:
+    """
+    Reverse of `slice_outputs`.  Works with negative starts (e.g. pad = -2).
+    Returns shape (1, N).
+    """
+    # 1 ── total length ------------------------------------------------------
+    pos_stop_max  = 0        # largest positive stop we see
+    tail_required = 0        # how many extra elements negative slices need
+
+    for k, sl in slices.items():
+        if k not in heads:          # optional head not present
+            continue
+        size = heads[k].size
+
+        start = 0 if sl.start is None else sl.start
+        stop  = sl.stop
+
+        if start >= 0:
+            pos_stop_max = max(pos_stop_max, start + size)
+        else:                       # negative start ⇒ counts from the end
+            # example: start = -2, size = 2  →  need 2 elems of tail
+            tail_required = max(tail_required, -start)
+
+        if stop and stop > 0:       # rare case: slice(-3, -1)
+            pos_stop_max = max(pos_stop_max, stop)
+
+    flat_len = pos_stop_max + tail_required
+
+    # 2 ── allocate ---------------------------------------------------------
+    sample = next(iter(heads.values()))
+    flat   = np.empty(flat_len, dtype=sample.dtype)
+
+    # 3 ── fill -------------------------------------------------------------
+    for k, sl in slices.items():
+        if k not in heads:
+            continue
+        head  = heads[k].ravel()
+        start = 0 if sl.start is None else sl.start
+        if start < 0:
+            start = flat_len + start      # convert to absolute index
+        flat[start:start + head.size] = head
+
+    return flat[np.newaxis, :]            # add batch dim
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float,distance:float) -> log.ModelDataV2.Action:
@@ -420,10 +467,22 @@ class ModelState:
 
 
     self.policy_ouput = pytorch_p_outputs
+    print(self.policy_output_slices)
 
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
+    print(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
+    print(policy_outputs_dict)
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
     # print(policy_outputs_dict.keys())
+    heads     = policy_outputs_dict
+    flat_reco = join_policy_outputs(heads, self.policy_output_slices)
+
+    print(len(self.policy_ouput[0]))
+    print(len(flat_reco[0]))
+    # assert flat_reco.shape ==
+    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(flat_reco[0].reshape(-1), self.policy_output_slices))
+    # combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
+
     return combined_outputs_dict,image_feed
 
 from collections import namedtuple

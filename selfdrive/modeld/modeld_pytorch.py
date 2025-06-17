@@ -45,6 +45,8 @@ import cv2
 from numpy.polynomial.polynomial import polyval
 import onnx2pytorch
 import onnx
+import inspect
+from onnx2pytorch import ConvertModel
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -83,6 +85,33 @@ MIN_LAT_CONTROL_SPEED = 0.3
 
 save_dir = "./saved_frames"
 os.makedirs(save_dir, exist_ok=True)
+
+# ── paths ────────────────────────────────────────────────────
+ROOT      = Path("/home/adas/openpilot/selfdrive/modeld/models")
+ONNX_PATH = ROOT / "driving_policy_with_nav_ir10.onnx"
+CKPT_PATH = ROOT / "driving_policy_state_dict_ir10.pt"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype  = torch.float16
+
+# ─────────────────────────────────────────────────────────────
+# 1. Build the architecture                                   |
+#    ▸ try to keep initializers as Parameters if the           |
+#      installed onnx2pytorch supports it                      |
+# ─────────────────────────────────────────────────────────────
+def build_model():
+    kwargs = {}
+    sig = inspect.signature(ConvertModel.__init__)
+    if "keep_initializers_as_params" in sig.parameters:
+        kwargs["keep_initializers_as_params"] = True   # old-checkpoint-compatible
+        print("[i] using keep_initializers_as_params=True")
+    else:
+        print("[i] parameter not supported (older onnx2pytorch) – falling back")
+
+    model = ConvertModel(onnx.load(ONNX_PATH), **kwargs).to(device)
+    model = model.half()               # fp16 like the checkpoint
+    model.requires_grad_(False).eval()
+    return model
 
 def b(a):
     k = 0.01
@@ -168,6 +197,15 @@ def show_all_feeds(image_feed: dict):
     cv2.imshow("All Feeds", canvas)
     # if cv2.waitKey(1) & 0xFF == ord('q'):
     #     return
+
+
+model_pp = build_model()
+saved_sd   = torch.load(CKPT_PATH, map_location=device,weights_only=True)
+model_sd   = model_pp.state_dict()
+
+# keep only the intersection
+filtered_sd = {k: v for k, v in saved_sd.items() if k in model_sd}
+model_pp.load_state_dict(filtered_sd, strict=False)
 
 
 class FrameMeta:
@@ -308,7 +346,7 @@ class ModelState:
       for name, arr in self.numpy_inputs.items()
     }
     with torch.inference_mode():
-      pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
+      pytorch_p_outputs = model_pp(**torch_policy_inputs)
     pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
 
 

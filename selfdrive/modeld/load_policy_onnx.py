@@ -9,7 +9,7 @@ import onnx
 import onnx2pytorch
 # import onnx2keras
 
-path_to_onnx_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy.onnx'
+path_to_onnx_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav_ir10.onnx'
 
 model = onnx.load(path_to_onnx_model)
 
@@ -35,6 +35,8 @@ torch_inputs = {
     'lateral_control_params': torch.ones((1, 2), dtype=torch.float16).to(device),
     'prev_desired_curv': torch.ones((1, 25,1), dtype=torch.float16).to(device),
     'features_buffer': torch.ones((1, 25,512), dtype=torch.float16).to(device),
+    'nav_features' : torch.ones((1,256), dtype=torch.float16).to(device),
+    'nav_instructions' : torch.ones((1,150), dtype=torch.float16).to(device),
 }
 
 onnx_inputs = {
@@ -43,6 +45,8 @@ onnx_inputs = {
     'lateral_control_params': np.ones((1, 2), dtype=np.float16),
     'prev_desired_curv': np.ones((1, 25,1), dtype=np.float16),
     'features_buffer': np.ones((1, 25,512), dtype=np.float16),
+    'nav_features' : np.ones((1,256), dtype=np.float16),
+    'nav_instructions' : np.ones((1,150), dtype=np.float16),
 }
 
 

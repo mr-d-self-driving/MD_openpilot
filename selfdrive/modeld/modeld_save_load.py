@@ -51,7 +51,7 @@ PROCESS_NAME = "selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 VISION_ONNX_PATH = Path(__file__).parent / 'models/driving_vision.onnx'
-POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy_aug.onnx'
+# POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy_aug.onnx'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
 
@@ -68,11 +68,22 @@ pytorch_vision_model_loaded = onnx2pytorch.ConvertModel(model_vision).to(device)
 pytorch_vision_model_loaded.requires_grad_(False)
 pytorch_vision_model_loaded.eval()
 
-path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav.onnx'
+path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav_ir10.onnx'
 model_policy = onnx.load(path_to_onnx_policy_model)
 pytorch_policy_model_loaded = onnx2pytorch.ConvertModel(model_policy).to(device)
 pytorch_policy_model_loaded.requires_grad_(False)
 pytorch_policy_model_loaded.eval()
+
+
+ckpt_path = Path("/home/adas/openpilot/selfdrive/modeld/models/driving_policy_pt.pth")
+
+# Move to CPU first so tensors are stored as CPU tensors (safer portability)
+cpu_model = pytorch_policy_model_loaded.to("cpu")
+torch.save(cpu_model.state_dict(), ckpt_path)
+
+print(f"✔️  State-dict written to {ckpt_path}")
+pytorch_policy_model_loaded.to("cuda:0")
+
 
 # state_dict = torch.load(ckpt_path, map_location=device)
 # pytorch_model_loaded.load_state_dict(state_dict, strict=True)
@@ -145,6 +156,7 @@ def show_two_yuv_combined(raw: np.ndarray):
 
     return combined
 
+
 def show_all_feeds(image_feed: dict):
     """
     image_feed: dict[key -> BGR numpy array of shape (256, 1024, 3)]
@@ -169,6 +181,26 @@ def show_all_feeds(image_feed: dict):
     # if cv2.waitKey(1) & 0xFF == ord('q'):
     #     return
 
+class Recorder:
+    """
+    Very small helper – zero dependencies beyond NumPy.
+    Call .write(inputs_dict, step_idx) once per frame.
+    """
+    def __init__(self, root="logs"):
+        ts = time.strftime("%Y-%m-%d-%H-%M-%S")
+        self.run_dir = Path(root) / ts
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        # store metadata once
+        # (self.run_dir / "meta.json").write_text(json.dumps({
+        #     "timestamp": ts,
+        #     # "vision_model": hash_file("/path/to/driving_vision.onnx"),
+        #     # "policy_model": hash_file("/path/to/driving_policy.onnx"),
+        # }, indent=2))
+
+    def write(self, inputs: dict[str, np.ndarray], step: int):
+        fname = self.run_dir / f"inputs_{step:06d}.npz"
+        # np.savez_compressed preserves dtypes exactly
+        np.savez_compressed(fname, **inputs)
 
 class FrameMeta:
   frame_id: int = 0
@@ -204,6 +236,9 @@ class ModelState:
     # self.dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
     self.pytorch_vision_model_loaded = pytorch_vision_model_loaded
     self.pytorch_policy_model_loaded = pytorch_policy_model_loaded
+
+    self.recoder = Recorder()
+    self.frame_counter = 0
 
     with open(VISION_METADATA_PATH, 'rb') as f:
       vision_metadata = pickle.load(f)
@@ -316,6 +351,16 @@ class ModelState:
 
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
+
+    # if self.record:
+    record_dict = {
+        **onnx_feed,                        # input_imgs, big_input_imgs
+        **{k: v.copy() for k, v in self.numpy_inputs.items()},
+        # "vision_out": combined_outputs_dict["hidden_state"].copy(),  # or any vision output you trust
+        "policy_out": self.policy_ouput[0].copy(),
+    }
+    self.recoder.write(record_dict, self.frame_counter)
+    self.frame_counter += 1
     # print(policy_outputs_dict.keys())
     return combined_outputs_dict,image_feed
 
