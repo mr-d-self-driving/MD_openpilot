@@ -158,10 +158,14 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 VISION_ONNX_PATH = Path(__file__).parent / 'models/driving_vision.onnx'
 POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy_aug.onnx'
+NAV_ONNX_PATH = Path(__file__).parent / 'models/supercombo_2.onnx'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
+NAV_METADATA_PATH = Path(__file__).parent / 'models/supercombo_metadata.pkl'
+
 
 dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+nav_onnx = ort.InferenceSession(NAV_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 # dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 input_name = dv_onnx.get_inputs()[0].name
 _, c_in, h_in, w_in = dv_onnx.get_inputs()[0].shape
@@ -345,14 +349,13 @@ class ModelState:
       'big_input_imgs': DrivingModelFrame(context, ModelConstants.TEMPORAL_SKIP)
     }
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
-    nav_features = np.zeros(ModelConstants.NAV_FEATURE_LEN, dtype=np.float32)
-    nav_instructions = np.zeros(ModelConstants.NAV_INSTRUCTION_LEN, dtype=np.float32)
+
     # print(nav_instructions)
 
-    self.full_features_buffer = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN,  ModelConstants.FEATURE_LEN), dtype=np.float32)
+    self.full_features_buffer = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN-1,  ModelConstants.FEATURE_LEN), dtype=np.float32)
     self.full_desire = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.DESIRE_LEN), dtype=np.float32)
     self.full_prev_desired_curv = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.PREV_DESIRED_CURV_LEN), dtype=np.float32)
-    self.temporal_idxs = slice(-1-(ModelConstants.TEMPORAL_SKIP*(ModelConstants.INPUT_HISTORY_BUFFER_LEN-1)), None, ModelConstants.TEMPORAL_SKIP)
+    self.temporal_idxs = slice(-1-(1*(100-1)), None, 1)
     self.dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 
     # self.dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
@@ -371,17 +374,24 @@ class ModelState:
       self.policy_output_slices = policy_metadata['output_slices']
       policy_output_size = policy_metadata['output_shapes']['outputs'][1]
 
+    with open(NAV_METADATA_PATH, 'rb') as f:
+      nav_metadata = pickle.load(f)
+      self.nav_input_shapes =  nav_metadata['input_shapes']
+      self.nav_output_slices = nav_metadata['output_slices']
+      print(self.nav_output_slices)
+      nav_output_size = nav_metadata['output_shapes']['outputs'][1]
+
     # img buffers are managed in openCL transform code
     self.vision_inputs: dict[str, Tensor] = {}
     self.vision_output = np.zeros(vision_output_size, dtype=np.float32)
     self.numpy_inputs = {
-      'desire': np.zeros((1, ModelConstants.INPUT_HISTORY_BUFFER_LEN, ModelConstants.DESIRE_LEN), dtype=np.float16),
+      'desire': np.zeros((1, 100, ModelConstants.DESIRE_LEN), dtype=np.float16),
       'nav_features' : np.ones((1,ModelConstants.NAV_FEATURE_LEN), dtype=np.float32),
       'nav_instructions' : np.ones((1,ModelConstants.NAV_INSTRUCTION_LEN), dtype=np.float32),
       'traffic_convention': np.zeros((1, ModelConstants.TRAFFIC_CONVENTION_LEN), dtype=np.float16),
       'lateral_control_params': np.zeros((1, ModelConstants.LATERAL_CONTROL_PARAMS_LEN), dtype=np.float16),
-      'prev_desired_curv': np.zeros((1, ModelConstants.INPUT_HISTORY_BUFFER_LEN, ModelConstants.PREV_DESIRED_CURV_LEN), dtype=np.float16),
-      'features_buffer': np.zeros((1, ModelConstants.INPUT_HISTORY_BUFFER_LEN,  ModelConstants.FEATURE_LEN), dtype=np.float16),
+      'prev_desired_curv': np.zeros((1,100, ModelConstants.PREV_DESIRED_CURV_LEN), dtype=np.float16),
+      'features_buffer': np.zeros((1, 99,  ModelConstants.FEATURE_LEN), dtype=np.float16),
     }
     self.policy_inputs = {k: Tensor(v, device='cuda').realize() for k,v in self.numpy_inputs.items()}
     self.policy_output = np.zeros(policy_output_size, dtype=np.float32)
@@ -414,10 +424,12 @@ class ModelState:
     self.full_desire[0,:-1] = self.full_desire[0,1:]
     self.full_desire[0,-1] = new_desire
     # print(f'new_desire:{new_desire}')
-    self.numpy_inputs['desire'][:] = self.full_desire.reshape((1,ModelConstants.INPUT_HISTORY_BUFFER_LEN,ModelConstants.TEMPORAL_SKIP,-1)).max(axis=2)
+    self.numpy_inputs['desire'][:] = self.full_desire.reshape((1,100,1,-1)).max(axis=2)
     # print(self.numpy_inputs['desire'][:])
     self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
     self.numpy_inputs['lateral_control_params'][:] = inputs['lateral_control_params']
+    self.numpy_inputs['nav_features'][:] = inputs['nav_features']
+    self.numpy_inputs['nav_instructions'][:] = inputs['nav_instructions']
     onnx_feed = {}
     image_feed = {}
     torch_feed = {}
@@ -427,63 +439,89 @@ class ModelState:
 
     for key in imgs_cl:
       frame_input = self.frames[key].buffer_from_cl(imgs_cl[key]).reshape(self.vision_input_shapes[key])
-      self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8).realize()
+      self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.float16).realize()
       tensor = self.vision_inputs[key]
       if isinstance(tensor, Tensor):
           np_arr = tensor.numpy()
       else:
           np_arr = tensor
-      assert np_arr.dtype == np.uint8, f"{key} is {np_arr.dtype}, expected uint8"
+      assert np_arr.dtype == np.float16, f"{key} is {np_arr.dtype}, expected uint8"
       onnx_feed[key] = np_arr
       torch_tensor = torch.from_numpy(np_arr).to(device)
 
       torch_feed[key] = torch_tensor                              # add to dict
-      image_feed[key] = show_two_yuv_combined(np_arr)
+      # image_feed[key] = show_two_yuv_combined(np_arr)
 
     # show_all_feeds(image_feed)
 
-    onnx_outputs = self.dv_onnx.run(None, onnx_feed)
+    # onnx_outputs = self.dv_onnx.run(None, onnx_feed)
 
 
-    with torch.inference_mode():
-      pytorch_outputs = self.pytorch_vision_model_loaded(**torch_feed)
-    pytorch_outputs = [out.detach().cpu().numpy() for out in pytorch_outputs]
+    # with torch.inference_mode():
+    #   pytorch_outputs = self.pytorch_vision_model_loaded(**torch_feed)
+    # pytorch_outputs = [out.detach().cpu().numpy() for out in pytorch_outputs]
 
-    output_array = onnx_outputs[0].reshape(-1)
-    model_len_v    = output_array.shape[0]
+    # output_array = onnx_outputs[0].reshape(-1)
+    # model_len_v    = output_array.shape[0]
 
-    vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(output_array, self.vision_output_slices))
-    self.full_features_buffer[0,:-1] = self.full_features_buffer[0,1:]
-    self.full_features_buffer[0,-1] = vision_outputs_dict['hidden_state'][0, :]
-    self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
+    # vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(output_array, self.vision_output_slices))
+    # self.full_features_buffer[0,:-1] = self.full_features_buffer[0,1:]
+    # self.full_features_buffer[0,-1] = vision_outputs_dict['hidden_state'][0, :]
+    # self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
 
     torch_policy_inputs = {
       name: torch.from_numpy(arr).to(device).to(torch.float16)
       for name, arr in self.numpy_inputs.items()
     }
-    with torch.inference_mode():
-      pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
-    pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
+    policy_feed = {
+        name: arr.astype(np.float16, copy=False)       # ONNX policy expects fp16
+        for name, arr in self.numpy_inputs.items()
+    }
+    # with torch.inference_mode():
+    #   pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
+    # pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
 
 
-    self.policy_ouput = pytorch_p_outputs
-    print(self.policy_output_slices)
+    # self.policy_ouput = pytorch_p_outputs
+    # print(self.policy_output_slices)
 
-    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
-    tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
-    print(tmp['desired_curvature'])
-    combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
-    # print(policy_outputs_dict.keys())
-    heads     = policy_outputs_dict
-    flat_reco = join_policy_outputs(heads, self.policy_output_slices)
-
-    print(len(self.policy_ouput[0]))
-    print(len(flat_reco[0]))
-    # assert flat_reco.shape ==
-    policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(flat_reco[0].reshape(-1), self.policy_output_slices))
+    # policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
+    # tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
+    # print(tmp['desired_curvature'])
     # combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
 
-    return combined_outputs_dict,image_feed
+    combined_inputs = {
+        **onnx_feed,                                          # vision tensors (uint8)
+        **policy_feed
+    }
+    # print(combined_inputs)
+    nav_outputs = nav_onnx.run(None, combined_inputs)
+    nav_outputs_array = nav_outputs[0].reshape(-1)
+    print(f'nav_outputs:{nav_outputs_array}')
+    print(self.slice_outputs(nav_outputs_array,self.nav_output_slices))
+    outputs = self.parser.parse_nav_outputs(self.slice_outputs(nav_outputs_array,self.nav_output_slices))
+    print(outputs)
+    self.full_features_buffer[0,:-1] = self.full_features_buffer[0,1:]
+    self.full_features_buffer[0,-1] = outputs['hidden_state'][0, :]
+    self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
+    # self.numpy_inputs['features_buffer'][:-ModelConstants.FEATURE_LEN] = self.numpy_inputs['features_buffer'][ModelConstants.FEATURE_LEN:]
+    # self.numpy_inputs['features_buffer'][-ModelConstants.FEATURE_LEN:] = nav_outputs_array['hidden_state'][0, :]
+    self.full_prev_desired_curv[0,:-1] = self.full_prev_desired_curv[0,1:]
+    self.full_prev_desired_curv[0,-1] = outputs['desired_curvature'][0, :]
+    self.numpy_inputs['prev_desired_curv'][:] = self.full_prev_desired_curv[0, self.temporal_idxs]
+    # self.numpy_inputs['prev_desired_curv'][:-ModelConstants.PREV_DESIRED_CURV_LEN] = self.numpy_inputs['prev_desired_curv'][ModelConstants.PREV_DESIRED_CURV_LEN:]
+    # self.numpy_inputs['prev_desired_curv'][-ModelConstants.PREV_DESIRED_CURV_LEN:] = nav_outputs_array['desired_curvature'][0, :]
+    # print(policy_outputs_dict.keys())
+    # heads     = policy_outputs_dict
+    # flat_reco = join_policy_outputs(heads, self.policy_output_slices)
+
+    # print(len(self.policy_ouput[0]))
+    # print(len(flat_reco[0]))
+    # # assert flat_reco.shape ==
+    # policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(flat_reco[0].reshape(-1), self.policy_output_slices))
+    # combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
+
+    return outputs,image_feed
 
 from collections import namedtuple
 def bgr_to_nv12_buf(bgr: np.ndarray) -> VisionBuf:
@@ -583,6 +621,8 @@ def main(demo=False):
 
   publish_state = PublishState()
   params = Params()
+  nav_features = np.zeros(ModelConstants.NAV_FEATURE_LEN, dtype=np.float32)
+  nav_instructions = np.zeros(ModelConstants.NAV_INSTRUCTION_LEN, dtype=np.float32)
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_FREQ)
@@ -879,10 +919,30 @@ def main(demo=False):
     if prepare_only:
       cloudlog.error(f"skipping model eval. Dropped {vipc_dropped_frames} frames")
 
+
+    nav_features[:] = 0
+    nav_instructions[:] = 0
+
+    if  sm.updated["navModelDEPRECATED"]:
+      nav_features = np.array(sm["navModelDEPRECATED"].features)
+    if  sm.updated["navInstruction"]:
+      nav_instructions[:] = 0
+      for maneuver in sm["navInstruction"].allManeuvers:
+        distance_idx = 25 + int(maneuver.distance / 20)
+        direction_idx = 0
+        if maneuver.modifier in ("left", "slight left", "sharp left"):
+          direction_idx = 1
+        if maneuver.modifier in ("right", "slight right", "sharp right"):
+          direction_idx = 2
+        if 0 <= distance_idx < 50:
+          nav_instructions[distance_idx*3 + direction_idx] = 1
+
     inputs:dict[str, np.ndarray] = {
       'desire': vec_desire,
       'traffic_convention': traffic_convention,
       'lateral_control_params': lateral_control_params,
+      'nav_features': nav_features,
+      'nav_instructions': nav_instructions,
       }
 
     mt1 = time.perf_counter()
@@ -953,14 +1013,14 @@ def main(demo=False):
         xp_smooth = np.convolve(xp_r, kernel, mode='same')
         yp_smooth = np.convolve(yp_r, kernel, mode='same')
       pred_line .set_data(xp_smooth, yp_smooth)
-      pos = modelv2_send.modelV2.position           # shortcut
-      # print(f'pos_x:{pos.x}')
-      print(f'pos:{pos}')
+      # pos = modelv2_send.modelV2.position           # shortcut
+      # # print(f'pos_x:{pos.x}')
+      # print(f'pos:{pos}')
 
-      pos.x     = yp_smooth.astype(float).tolist()       # forward → x
-      pos.y     = xp_smooth.astype(float).tolist()       # left    → y
-      pos.xStd  = [0.05] * len(tgrid)
-      pos.yStd  = [0.05] * len(tgrid)
+      # pos.x     = yp_smooth.astype(float).tolist()       # forward → x
+      # pos.y     = xp_smooth.astype(float).tolist()       # left    → y
+      # pos.xStd  = [0.05] * len(tgrid)
+      # pos.yStd  = [0.05] * len(tgrid)
 
 
 
