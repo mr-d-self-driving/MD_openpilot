@@ -440,7 +440,7 @@ class ModelState:
       torch_feed[key] = torch_tensor                              # add to dict
       image_feed[key] = show_two_yuv_combined(np_arr)
 
-    # show_all_feeds(image_feed)
+    show_all_feeds(image_feed)
 
     onnx_outputs = self.dv_onnx.run(None, onnx_feed)
 
@@ -529,7 +529,7 @@ def bgr_to_nv12_buf(bgr: np.ndarray) -> VisionBuf:
 
 
 def main(demo=False):
-  # cv2.namedWindow("All Feeds", cv2.WINDOW_NORMAL)
+  cv2.namedWindow("All Feeds", cv2.WINDOW_NORMAL)
   cloudlog.warning("modeld init")
   from cereal.services import SERVICE_LIST   # modern branches
 # from cereal import service_list         # very old branches
@@ -732,7 +732,7 @@ def main(demo=False):
     g = sm["liveLocationKalmanDEPRECATED"]
 
     if g.status != "valid" or not g.positionGeodetic.valid:
-        return
+        continue
 
     lat, lon, _ = g.positionGeodetic.value
     live_lats.append(lat); live_lons.append(lon)

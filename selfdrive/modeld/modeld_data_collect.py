@@ -266,7 +266,7 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
     desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
     desired_curvature = model_output['desired_curvature']
 
-    print(f'model_desired_curvature:{desired_curvature}')
+    # print(f'model_desired_curvature:{desired_curvature}')
     # desired_curvature = max(min(model_output['desired_curvature'][0, 0],0.1),-0.1)
     if distance < 20:
       desired_curvature = 0.1
@@ -274,7 +274,7 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
       # cloudlog.warning(f'desired_curvature:{desired_curvature:.4f}')
       desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, LAT_SMOOTH_SECONDS)
     else:
-      cloudlog.warning(f'ppppppppppppppppppppppppppppppppp:{desired_curvature}')
+      # cloudlog.warning(f'ppppppppppppppppppppppppppppppppp:{desired_curvature}')
       desired_curvature = prev_action.desiredCurvature
     # cloudlog.warning(f'ppppppppppppppppppppppppppppppppp:{desired_curvature}')
     return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
@@ -489,9 +489,9 @@ class ModelState:
     onnx_outputs = self.dv_onnx.run(None, onnx_feed)
 
 
-    with torch.inference_mode():
-      pytorch_outputs = self.pytorch_vision_model_loaded(**torch_feed)
-    pytorch_outputs = [out.detach().cpu().numpy() for out in pytorch_outputs]
+    # with torch.inference_mode():
+    #   pytorch_outputs = self.pytorch_vision_model_loaded(**torch_feed)
+    # pytorch_outputs = [out.detach().cpu().numpy() for out in pytorch_outputs]
 
     output_array = onnx_outputs[0].reshape(-1)
     model_len_v    = output_array.shape[0]
@@ -511,7 +511,7 @@ class ModelState:
 
 
 
-    print(self.policy_output_slices)
+    # print(self.policy_output_slices)
 
 
     PLAN_FLOATS      = 4_955           # total floats in "plan"
@@ -542,12 +542,14 @@ class ModelState:
     #        update the list element in place so everyone sees the edit
     flat_policy[5880] = inputs['dr_cv']
     pytorch_p_outputs[0][...] = flat_policy             # in-place update
-    self.logger.add(torch_policy_inputs, pytorch_p_outputs)
+    if inputs['save']:
+      print('Save')
+      self.logger.add(torch_policy_inputs, pytorch_p_outputs)
 
     self.policy_ouput = pytorch_p_outputs
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
     tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
-    print(tmp['desired_curvature'])
+    # print(tmp['desired_curvature'])
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
 
     return combined_outputs_dict,image_feed
@@ -663,17 +665,19 @@ def main(demo=False):
   buf_main, buf_extra = None, None
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
+  # print('sub_all_msg')
 
 
-  if demo:
-    CP = get_demo_car_params()
-  else:
-    CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
-  cloudlog.info("modeld got CarParams: %s", CP.brand)
+  # if demo:
+  #   CP = get_demo_car_params()
+  # else:
+  #   # print('sub_all_msg')
+  #   CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
+  # cloudlog.info("modeld got CarParams: %s", CP.brand)
 
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
-  long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
+  long_delay = 0.15000000596046448 + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -687,51 +691,9 @@ def main(demo=False):
       # cloudlog.warning(f"VisionBuf attrs: {attrs}")
       if buf_main is None:
         break
-
-      h         = buf_main.height
-      w         = buf_main.width
-      s         = buf_main.stride     # bytes per row in both Y & UV planes
-      uv_off    = buf_main.uv_offset  # byte offset where UV plane starts in buf.data
-
-      # 2. View the entire buffer as one flat uint8 array
-      raw = np.frombuffer(buf_main.data, dtype=np.uint8)
-
-      # 3. Extract & reshape the Y plane (h rows × s bytes), then crop to actual width
-      y_plane = raw[0 : h*s]\
-                  .reshape((h, s))\
-                  [:, :w]
-
-      # 4. Extract & reshape the UV plane ((h/2) rows × s bytes), then crop
-      uv_plane = raw[uv_off : uv_off + (h//2)*s]\
-                  .reshape((h//2, s))\
-                  [:, :w]
-
-      # 5. Stack into NV12 layout and convert to BGR
-      nv12 = np.vstack((y_plane, uv_plane))
-      bgr  = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
-
-      resized = cv2.resize(bgr, (w_in, h_in), interpolation=cv2.INTER_LINEAR)
-      # 2. BGR → RGB
-      rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-      # 3. Normalize to [0,1]
-      img_f32 = rgb.astype(np.float32) / 255.0
-      # 4. HWC → CHW, add batch dim
-      model_input = img_f32.transpose(2, 0, 1)[None, :, :, :]  # shape (1,3,h_in,w_in)
-
-      # 5. Run inference
-      # outputs = dv_onnx.run(None, {input_name: model_input})
-      #    → `outputs` is a list of numpy arrays, one per output of your onnx graph
-
-      # 6. Display
-      # cv2.imshow("road camera", bgr)
-      # cv2.waitKey(1)
-      # filename = os.path.join(save_dir, f"frame_{meta_main.timestamp_sof}.png")
-      # success = cv2.imwrite(filename, bgr)
-      # if not success:
-      #     print(f"Failed to write {filename}")
       frame_idx += 1
 
-
+    # print('sub_all_msg')
     if buf_main is None:
       cloudlog.debug("vipc_client_main no frame")
       continue
@@ -743,43 +705,6 @@ def main(demo=False):
         meta_extra = FrameMeta(vipc_client_extra)
         if buf_extra is None or meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
           break
-        h         = buf_extra.height
-        w         = buf_extra.width
-        s         = buf_extra.stride     # bytes per row in both Y & UV planes
-        uv_off    = buf_extra.uv_offset  # byte offset where UV plane starts in buf.data
-
-        # 2. View the entire buffer as one flat uint8 array
-        raw = np.frombuffer(buf_extra.data, dtype=np.uint8)
-
-        # 3. Extract & reshape the Y plane (h rows × s bytes), then crop to actual width
-        y_plane = raw[0 : h*s]\
-                    .reshape((h, s))\
-                    [:, :w]
-
-        # 4. Extract & reshape the UV plane ((h/2) rows × s bytes), then crop
-        uv_plane = raw[uv_off : uv_off + (h//2)*s]\
-                    .reshape((h//2, s))\
-                    [:, :w]
-
-        # 5. Stack into NV12 layout and convert to BGR
-        nv12 = np.vstack((y_plane, uv_plane))
-        bgr  = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
-
-        resized = cv2.resize(bgr, (w_in, h_in), interpolation=cv2.INTER_LINEAR)
-        # 2. BGR → RGB
-        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        # 3. Normalize to [0,1]
-        img_f32 = rgb.astype(np.float32) / 255.0
-        # 4. HWC → CHW, add batch dim
-        model_input = img_f32.transpose(2, 0, 1)[None, :, :, :]  # shape (1,3,h_in,w_in)
-
-        # 5. Run inference
-        # outputs = dv_onnx.run(None, {input_name: model_input})
-        #    → `outputs` is a list of numpy arrays, one per output of your onnx graph
-
-        # 6. Display
-        # cv2.imshow("extra camera", bgr)
-        cv2.waitKey(1)
 
       if buf_extra is None:
         cloudlog.debug("vipc_client_extra no frame")
@@ -799,7 +724,7 @@ def main(demo=False):
     g = sm["liveLocationKalmanDEPRECATED"]
 
     if g.status != "valid" or not g.positionGeodetic.valid:
-        return
+        continue
 
     lat, lon, _ = g.positionGeodetic.value
     live_lats.append(lat); live_lons.append(lon)
@@ -822,7 +747,7 @@ def main(demo=False):
     nxt_lat = route_lats[idx:idx+args.n] if dists[idx] < args.thresh else np.array([])
     nxt_lon = route_lons[idx:idx+args.n] if dists[idx] < args.thresh else np.array([])
     desire_cur = route_d_cur[idx+1]
-    print(f'GT_desire_cur:{desire_cur}')
+    # print(f'GT_desire_cur:{desire_cur}')
 
     # planar projection
     gx,  gy  = equirect(np.asarray(live_lats), np.asarray(live_lons),
@@ -871,13 +796,15 @@ def main(demo=False):
     }
 
     # Displaying the next maneuver
-    # if next_maneuver['distance'] != 0:
-    #  print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
-
+    save_flat = False
+    if next_maneuver['distance'] != 0:
+     print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
+    if sm["navInstruction"].maneuverDistance <25 and sm["navInstruction"].maneuverDistance > -5 and  sm["navInstruction"].maneuverType == 'turn':
+       save_flat = True
     lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
-    cloudlog.warning(f'steeringAngleDeg:{sm["carState"].steeringAngleDeg}')
-    cloudlog.warning(f'steeringTorque:{sm["carState"].steeringTorque}')
-    cloudlog.warning(f'steeringPressed:{sm["carState"].steeringPressed}')
+    # cloudlog.warning(f'steeringAngleDeg:{sm["carState"].steeringAngleDeg}')
+    # cloudlog.warning(f'steeringTorque:{sm["carState"].steeringTorque}')
+    # cloudlog.warning(f'steeringPressed:{sm["carState"].steeringPressed}')
     # cloudlog.warning(f'Model_desire_curv:{sm["modelV2"].action.desiredCurvature}')
     lateral_control_params = np.array([v_ego, lat_delay], dtype=np.float32)
     if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
@@ -959,7 +886,7 @@ def main(demo=False):
         win = 9                       # experiment: 5-9 points work well for 33-pt path
         win = win | 1                 # make sure it’s odd
         if len(t_tmp) < win:          # short safety
-            win = len(tgrid) | 1
+            win = len(t_tmp) | 1
 
         poly = 3                      # cubic fits most OP paths
         xp_smooth = savgol_filter(xp_r, win, poly)
@@ -984,6 +911,7 @@ def main(demo=False):
       'x':xp,
       'y':yp,
       'dr_cv':desire_cur,
+      'save':save_flat,
       }
     mt1 = time.perf_counter()
     model_output,canvas_feed = model.run(buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)
@@ -995,7 +923,7 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-      print(model_output['desired_curvature'][0][0])
+      # print(model_output['desired_curvature'][0][0])
 
       # cloudlog.warning(1/model_output['desired_curvature'][0][0])
       # cloudlog.warning(model_output['lane_lines_prob'])
