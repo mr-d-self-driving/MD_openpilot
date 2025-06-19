@@ -185,14 +185,22 @@ pytorch_vision_model_loaded = onnx2pytorch.ConvertModel(model_vision).to(device)
 pytorch_vision_model_loaded.requires_grad_(False)
 pytorch_vision_model_loaded.eval()
 
-path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_aug.onnx'
+path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav.onnx'
 model_policy = onnx.load(path_to_onnx_policy_model)
 pytorch_policy_model_loaded = onnx2pytorch.ConvertModel(model_policy).to(device)
 pytorch_policy_model_loaded.requires_grad_(False)
 pytorch_policy_model_loaded.eval()
 
-# state_dict = torch.load(ckpt_path, map_location=device)
-# pytorch_model_loaded.load_state_dict(state_dict, strict=True)
+ckpt_path = "/home/adas/openpilot/selfdrive/modeld/models/driving_policy_state_dict.pt"
+
+# scripted = torch.jit.script(pytorch_policy_model_loaded)
+# scripted.save("driving_vision_scripted.pt")
+# model_test = torch.jit.load("driving_vision_scripted.pt", map_location="cpu")
+# model_test.eval()
+state_dict = torch.load(ckpt_path, map_location=device)
+# pytorch_policy_model_loaded.load_state_dict(state_dict, strict=True)
+# pytorch_policy_model_loaded.requires_grad_(False)
+# pytorch_policy_model_loaded.eval()
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.0
@@ -462,6 +470,8 @@ class ModelState:
     # print(self.numpy_inputs['desire'][:])
     self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
     self.numpy_inputs['lateral_control_params'][:] = inputs['lateral_control_params']
+    self.numpy_inputs['nav_features'][:] = inputs['nav_features']
+    self.numpy_inputs['nav_instructions'][:] = inputs['nav_instructions']
     onnx_feed = {}
     image_feed = {}
     torch_feed = {}
@@ -507,6 +517,8 @@ class ModelState:
     }
     with torch.inference_mode():
       pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
+      # model_test_output = model_test(**torch_policy_inputs)
+    # assert torch.allclose(pytorch_p_outputs, model_test_output, atol=1e-5)
     pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
 
 
@@ -542,9 +554,9 @@ class ModelState:
     #        update the list element in place so everyone sees the edit
     flat_policy[5880] = inputs['dr_cv']
     pytorch_p_outputs[0][...] = flat_policy             # in-place update
-    if inputs['save']:
-      print('Save')
-      self.logger.add(torch_policy_inputs, pytorch_p_outputs)
+    # if inputs['save']:
+    #   print('Save')
+    #   self.logger.add(torch_policy_inputs, pytorch_p_outputs)
 
     self.policy_ouput = pytorch_p_outputs
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
@@ -652,6 +664,8 @@ def main(demo=False):
 
   publish_state = PublishState()
   params = Params()
+  nav_features = np.zeros(ModelConstants.NAV_FEATURE_LEN, dtype=np.float32)
+  nav_instructions = np.zeros(ModelConstants.NAV_INSTRUCTION_LEN, dtype=np.float32)
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_FREQ)
@@ -797,8 +811,8 @@ def main(demo=False):
 
     # Displaying the next maneuver
     save_flat = False
-    if next_maneuver['distance'] != 0:
-     print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
+    # if next_maneuver['distance'] != 0:
+    #  print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
     if sm["navInstruction"].maneuverDistance <25 and sm["navInstruction"].maneuverDistance > -5 and  sm["navInstruction"].maneuverType == 'turn':
        save_flat = True
     lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
@@ -875,6 +889,24 @@ def main(demo=False):
     if prepare_only:
       cloudlog.error(f"skipping model eval. Dropped {vipc_dropped_frames} frames")
 
+    nav_features[:] = 0
+    nav_instructions[:] = 0
+
+    if  sm.updated["navModelDEPRECATED"]:
+      print("navModelDEPRECATED")
+      nav_features = np.array(sm["navModelDEPRECATED"].features)
+    if  sm.updated["navInstruction"]:
+      print("navInstruction")
+      nav_instructions[:] = 0
+      for maneuver in sm["navInstruction"].allManeuvers:
+        distance_idx = 25 + int(maneuver.distance / 20)
+        direction_idx = 0
+        if maneuver.modifier in ("left", "slight left", "sharp left"):
+          direction_idx = 1
+        if maneuver.modifier in ("right", "slight right", "sharp right"):
+          direction_idx = 2
+        if 0 <= distance_idx < 50:
+          nav_instructions[distance_idx*3 + direction_idx] = 1
 
     xp_r, yp_r = resample_xy_to_t(xp.astype(float),
                                     yp.astype(float),
@@ -904,6 +936,7 @@ def main(demo=False):
     xp     = yp_smooth.astype(float).tolist()       # forward → x
     yp     = xp_smooth.astype(float).tolist()
     pred_line .set_data(yp, xp)
+
     inputs:dict[str, np.ndarray] = {
       'desire': vec_desire,
       'traffic_convention': traffic_convention,
@@ -912,6 +945,8 @@ def main(demo=False):
       'y':yp,
       'dr_cv':desire_cur,
       'save':save_flat,
+      'nav_features': nav_features,
+      'nav_instructions': nav_instructions,
       }
     mt1 = time.perf_counter()
     model_output,canvas_feed = model.run(buf_main, buf_extra, model_transform_main, model_transform_extra, inputs)

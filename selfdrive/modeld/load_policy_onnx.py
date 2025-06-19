@@ -9,7 +9,7 @@ import onnx
 import onnx2pytorch
 # import onnx2keras
 
-path_to_onnx_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav_ir10.onnx'
+path_to_onnx_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav.onnx'
 
 model = onnx.load(path_to_onnx_model)
 
