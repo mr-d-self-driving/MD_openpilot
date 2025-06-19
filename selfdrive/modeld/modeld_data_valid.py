@@ -58,7 +58,7 @@ ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormat
 ap.add_argument("--route",  type=Path, default="/home/adas/openpilot/kalman_track_CS_2025-06-17_14-38-58.csv",
                 help="reference path (.csv or .rlog.bz2)")
 ap.add_argument("--thresh", type=float, default=20,  help="match threshold (m)")
-ap.add_argument("--n",      type=int,   default=50,  help="# future points to plot")
+ap.add_argument("--n",      type=int,   default=100,  help="# future points to plot")
 ap.add_argument("--hz",     type=float, default=100, help="UI refresh rate (Hz)")
 ap.add_argument("--window", type=float, default=50,  help="half window size (m)")
 args = ap.parse_args()
@@ -168,11 +168,13 @@ PROCESS_NAME = "selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 VISION_ONNX_PATH = Path(__file__).parent / 'models/driving_vision.onnx'
+NAV_ONNX_PATH = Path(__file__).parent / 'models/driving_policy_with_nav_finetuned.onnx'
 POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy_aug.onnx'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
 
 dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+nav_onnx = ort.InferenceSession(NAV_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 # dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 input_name = dv_onnx.get_inputs()[0].name
 _, c_in, h_in, w_in = dv_onnx.get_inputs()[0].shape
@@ -515,6 +517,11 @@ class ModelState:
       name: torch.from_numpy(arr).to(device).to(torch.float16)
       for name, arr in self.numpy_inputs.items()
     }
+    onnx_policy_input = {
+       name: arr.astype(np.float32,copy=False)
+       for name,arr in self.numpy_inputs.items()
+    }
+    nav_onnx_output = nav_onnx.run(None,onnx_policy_input)
     with torch.inference_mode():
       pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
       # model_test_output = model_test(**torch_policy_inputs)
@@ -523,46 +530,54 @@ class ModelState:
 
 
 
-    # print(self.policy_output_slices)
+    # # print(self.policy_output_slices)
 
 
-    PLAN_FLOATS      = 4_955           # total floats in "plan"
-    FLOATS_PER_TRAJ  = 991             # 33 × 15 × 2  + 1
-    IDX_N, WIDTH     = 33, 15
-    # DESIRED_CURV_SL = slice(5880, 5882)
+    # PLAN_FLOATS      = 4_955           # total floats in "plan"
+    # FLOATS_PER_TRAJ  = 991             # 33 × 15 × 2  + 1
+    # IDX_N, WIDTH     = 33, 15
+    # # DESIRED_CURV_SL = slice(5880, 5882)
 
 
-    # ── 1.  Unpack the plan head --------------------------------------
-    flat_policy = pytorch_p_outputs[0]        # numpy.ndarray
-    flat_policy = np.asarray(flat_policy).reshape(-1)   # shape (≈6 k,)
-    plan_raw = flat_policy[:PLAN_FLOATS].reshape(5, FLOATS_PER_TRAJ)
-    mu   = plan_raw[:, :495].reshape(5, IDX_N, WIDTH)   # (5, 33, 15)
-    logits = plan_raw[:, 990]
+    # # ── 1.  Unpack the plan head --------------------------------------
+    # flat_policy = pytorch_p_outputs[0]        # numpy.ndarray
+    # flat_policy = np.asarray(flat_policy).reshape(-1)   # shape (≈6 k,)
+    # plan_raw = flat_policy[:PLAN_FLOATS].reshape(5, FLOATS_PER_TRAJ)
+    # mu   = plan_raw[:, :495].reshape(5, IDX_N, WIDTH)   # (5, 33, 15)
+    # logits = plan_raw[:, 990]
 
-    best = int(np.argmax(softmax(logits)))              # 0 … 4
+    # best = int(np.argmax(softmax(logits)))              # 0 … 4
 
-    # ── 2.  Replace μ_x and μ_y for that best hypothesis --------------
-    mu[best, :, 0] = inputs['x']      # channel 0 → x_pos
-    mu[best, :, 1] = inputs['y']      # channel 1 → y_pos
-    # (you can also patch more channels here if desired)
+    # # ── 2.  Replace μ_x and μ_y for that best hypothesis --------------
+    # mu[best, :, 0] = inputs['x']      # channel 0 → x_pos
+    # mu[best, :, 1] = inputs['y']      # channel 1 → y_pos
+    # # (you can also patch more channels here if desired)
 
-    # ── 3.  Re-flatten and copy back into the big vector --------------
-    plan_raw[:, :495] = mu.reshape(5, 495)              # pack μ+σ block
-    flat_policy[:PLAN_FLOATS] = plan_raw.reshape(-1)    # overwrite slice
+    # # ── 3.  Re-flatten and copy back into the big vector --------------
+    # plan_raw[:, :495] = mu.reshape(5, 495)              # pack μ+σ block
+    # flat_policy[:PLAN_FLOATS] = plan_raw.reshape(-1)    # overwrite slice
 
-    # ── 4.  If the rest of your code still uses `pytorch_p_outputs`,
-    #        update the list element in place so everyone sees the edit
-    flat_policy[5880] = inputs['dr_cv']
-    pytorch_p_outputs[0][...] = flat_policy             # in-place update
+    # # ── 4.  If the rest of your code still uses `pytorch_p_outputs`,
+    # #        update the list element in place so everyone sees the edit
+    # flat_policy[5880] = inputs['dr_cv']
+    # pytorch_p_outputs[0][...] = flat_policy             # in-place update
+    # # if inputs['save']:
+    # #   print('Save')
+    # #   self.logger.add(torch_policy_inputs, pytorch_p_outputs)
+
+
     if inputs['save']:
-      print('Save')
-      self.logger.add(torch_policy_inputs, pytorch_p_outputs)
-
-    self.policy_ouput = pytorch_p_outputs
+      self.policy_ouput = nav_onnx_output
+    else:
+       self.policy_ouput = pytorch_p_outputs
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
     tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
     # print(tmp['desired_curvature'])
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
+
+    print(f"dr_cv:{inputs['dr_cv']}")
+    print(f"MD_cv:{policy_outputs_dict['desired_curvature']}")
+
 
     return combined_outputs_dict,image_feed
 

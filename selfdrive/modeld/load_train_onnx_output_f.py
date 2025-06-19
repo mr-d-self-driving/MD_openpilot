@@ -43,12 +43,12 @@ P.add_argument("--logdir", type=Path, default="/home/adas/openpilot/policy_logge
 P.add_argument("--onnx",  type=Path,
                default="/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav.onnx",
                help="Path to nav-aware ONNX graph")
-P.add_argument("--epochs", type=int,   default=100,    help="Fine-tuning epochs")
+P.add_argument("--epochs", type=int,   default=1500,    help="Fine-tuning epochs")
 P.add_argument("--lr",     type=float, default=2e-4, help="Learning rate")
 P.add_argument("--device", choices=["cpu", "cuda"],
                default="cuda" if torch.cuda.is_available() else "cpu")
 P.add_argument("--save",   type=Path,  default=None, help="Path to save state-dict")
-P.add_argument("--save_onnx", type=Path, default='/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav_finetuned.onnx',
+P.add_argument("--save_onnx", type=Path, default='/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav_finetuned_long.onnx',
                help="If given, write an ONNX file with updated Gemm weights")
 args = P.parse_args()
 

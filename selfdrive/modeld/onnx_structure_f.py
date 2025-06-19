@@ -45,7 +45,7 @@ def N(op: str, **kwargs):          # short for "named node"
 # --------------------------------------------------------------------------- #
 ROOT = Path('/home/adas/openpilot/selfdrive/modeld/models')
 IN_FILE  = ROOT / 'driving_policy.onnx'
-OUT_FILE = ROOT / 'driving_policy_with_nav.onnx'
+OUT_FILE = ROOT / 'driving_policy_with_normal_nav.onnx'
 print(f"Loading {IN_FILE} …")
 
 model = onnx.load(str(IN_FILE))
@@ -82,13 +82,13 @@ def residual(prefix: str, x: gs.Variable, width: int = 256, hidden: int = 512):
     after(fc1, relu1, fc2, add, relu2)
     return relu2.outputs[0]
 
-blk1 = residual('nav_blk1', nav_feat)
-blk2 = residual('nav_blk2', blk1)
+# blk1 = residual('nav_blk1', nav_feat)
+# blk2 = residual('nav_blk2', blk1)
 
-nav_vec = gs.Variable('nav_vec', dtype=np.float16)
-after(N('Gemm', inputs=[blk2, zeros('nav_proj_W', (256,256)), zeros('nav_proj_b', (256,))], outputs=[nav_vec]))
-nav_vec_relu = gs.Variable('nav_vec_relu', dtype=np.float16)
-after(N('Relu', inputs=[nav_vec], outputs=[nav_vec_relu]))
+# nav_vec = gs.Variable('nav_vec', dtype=np.float16)
+# after(N('Gemm', inputs=[blk2, zeros('nav_proj_W', (256,256)), zeros('nav_proj_b', (256,))], outputs=[nav_vec]))
+# nav_vec_relu = gs.Variable('nav_vec_relu', dtype=np.float16)
+# after(N('Relu', inputs=[nav_vec], outputs=[nav_vec_relu]))
 
 # --------------------------------------------------------------------------- #
 # 4 · Helper to pad Gemm weights                                               #
@@ -106,7 +106,7 @@ def pad_W(old: gs.Constant, name: str):
 plan_gemm = next(n for n in graph.nodes if n.op == 'Gemm' and n.name.endswith('/plan/Gemm'))
 plan_in   = plan_gemm.inputs[0]
 plan_concat_out = gs.Variable('plan_concat_in', dtype=np.float16)
-after(N('Concat', inputs=[plan_in, nav_vec_relu, nav_instr], outputs=[plan_concat_out], attrs={'axis': 1}))
+after(N('Concat', inputs=[plan_in, nav_feat, nav_instr], outputs=[plan_concat_out], attrs={'axis': 1}))
 plan_gemm.inputs[0] = plan_concat_out
 plan_gemm.inputs[1] = pad_W(plan_gemm.inputs[1], 'plan_weight_extended')
 
@@ -116,7 +116,7 @@ plan_gemm.inputs[1] = pad_W(plan_gemm.inputs[1], 'plan_weight_extended')
 action_gemm = next(n for n in graph.nodes if n.op == 'Gemm' and n.name.endswith('/action_block/action_block_in/action_block_in.0/Gemm'))
 act_in      = action_gemm.inputs[0]
 action_concat_out = gs.Variable('action_concat_in', dtype=np.float16)
-after(N('Concat', inputs=[act_in, nav_vec_relu, nav_instr], outputs=[action_concat_out], attrs={'axis': 1}))
+after(N('Concat', inputs=[act_in, nav_feat, nav_instr], outputs=[action_concat_out], attrs={'axis': 1}))
 action_gemm.inputs[0] = action_concat_out
 action_gemm.inputs[1] = pad_W(action_gemm.inputs[1], 'action_weight_extended')
 
