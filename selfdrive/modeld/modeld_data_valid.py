@@ -145,23 +145,6 @@ origin_lat, origin_lon = route_lats[0], route_lons[0]
 print(f"Loaded {len(route_lats)} route points from {args.route}")
 
 # ────────── Matplotlib boiler-plate ────────────────────────────────────────
-plt.ion()
-fig, ax = plt.subplots(figsize=(6, 6))
-fig.canvas.manager.set_window_title("GPS-centred + modelV2 override")
-
-route_line, = ax.plot([], [], ':',  color="grey", alpha=.5, label="reference")
-pred_line,  = ax.plot([], [], lw=3,  color="tab:blue",   label=f"next {args.n}")
-model_line, = ax.plot([], [], '--', color="tab:purple", label="modelV2 path")
-curr_pt,    = ax.plot([], [], "ro", ms=6, label="current")
-heading_q   = ax.quiver([], [], [], [],
-                        angles='xy', scale_units='xy', scale=1,
-                        color='limegreen', width=0.012, label="heading")
-ax.set_xlabel("X [m]"); ax.set_ylabel("Y [m]")
-ax.set_aspect("equal", adjustable="box"); ax.grid(True); ax.legend()
-W = args.window
-
-fig.canvas.draw()               # first paint
-fig.canvas.flush_events()
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -173,8 +156,8 @@ POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy_aug.onnx'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
 
-dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
-nav_onnx = ort.InferenceSession(NAV_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CPUExecutionProvider"])
+nav_onnx = ort.InferenceSession(NAV_ONNX_PATH, providers=["CPUExecutionProvider"])
 # dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 input_name = dv_onnx.get_inputs()[0].name
 _, c_in, h_in, w_in = dv_onnx.get_inputs()[0].shape
@@ -187,7 +170,7 @@ pytorch_vision_model_loaded = onnx2pytorch.ConvertModel(model_vision).to(device)
 pytorch_vision_model_loaded.requires_grad_(False)
 pytorch_vision_model_loaded.eval()
 
-path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_nav.onnx'
+path_to_onnx_policy_model = '/home/adas/openpilot/selfdrive/modeld/models/driving_policy_with_normal_nav.onnx'
 model_policy = onnx.load(path_to_onnx_policy_model)
 pytorch_policy_model_loaded = onnx2pytorch.ConvertModel(model_policy).to(device)
 pytorch_policy_model_loaded.requires_grad_(False)
@@ -195,14 +178,8 @@ pytorch_policy_model_loaded.eval()
 
 ckpt_path = "/home/adas/openpilot/selfdrive/modeld/models/driving_policy_state_dict.pt"
 
-# scripted = torch.jit.script(pytorch_policy_model_loaded)
-# scripted.save("driving_vision_scripted.pt")
-# model_test = torch.jit.load("driving_vision_scripted.pt", map_location="cpu")
-# model_test.eval()
 state_dict = torch.load(ckpt_path, map_location=device)
-# pytorch_policy_model_loaded.load_state_dict(state_dict, strict=True)
-# pytorch_policy_model_loaded.requires_grad_(False)
-# pytorch_policy_model_loaded.eval()
+
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.0
@@ -291,59 +268,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                   desiredAcceleration=float(desired_accel),
                                   shouldStop=bool(should_stop))
 import matplotlib.pyplot as plt
-def show_two_yuv_combined(raw: np.ndarray):
-    """
-    raw: uint8 array of shape (1,12,128,256)
-    Decodes two YUV frames, stacks them horizontally, and displays in one window.
-    """
-    # 1) Remove batch and split into two 6-channel frames
-    arr    = raw.squeeze(0)               # → (12,128,256)
-    frames = arr.reshape(2, 6, 128, 256)  # → (2,6,128,256)
-
-    bgr_frames = []
-    for f in frames:
-        # Rebuild full-res Y
-        Y = np.zeros((256, 512), dtype=np.uint8)
-        Y[0::2,0::2] = f[0]; Y[0::2,1::2] = f[1]
-        Y[1::2,0::2] = f[2]; Y[1::2,1::2] = f[3]
-        # Upsample U/V
-        U = cv2.resize(f[4], (512,256), interpolation=cv2.INTER_LINEAR)
-        V = cv2.resize(f[5], (512,256), interpolation=cv2.INTER_LINEAR)
-        # Stack & convert
-        yuv = np.stack((Y, U, V), axis=-1)
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
-        bgr_frames.append(bgr)
-        # bgr_frames = bgr
-
-    # 2) Combine horizontally: result shape = (256, 512*2, 3)
-    combined = np.hstack(bgr_frames)
-
-    return combined
-
-def show_all_feeds(image_feed: dict):
-    """
-    image_feed: dict[key -> BGR numpy array of shape (256, 1024, 3)]
-    Stacks them vertically and shows in one window.
-    """
-    # make sure we have at least one feed
-    if not image_feed:
-        return
-
-    # grab the list of arrays in insertion order
-    frames = list(image_feed.values())
-
-    # verify they all have the same width and channels
-    h, w, c = frames[0].shape
-    for f in frames:
-        assert f.shape[1] == w and f.shape[2] == c, "All feeds must have same width & channels"
-
-    # stack vertically into shape (256 * N, 1024, 3)
-    canvas = np.vstack(frames)
-
-    cv2.imshow("All Feeds", canvas)
-    # if cv2.waitKey(1) & 0xFF == ord('q'):
-    #     return
-
 
 class PolicyLogger:
     """Accumulates N frames and flushes them as one .pt shard on disk."""
@@ -385,7 +309,7 @@ class FrameMeta:
   def __init__(self, vipc=None):
     if vipc is not None:
       self.frame_id, self.timestamp_sof, self.timestamp_eof = vipc.frame_id, vipc.timestamp_sof, vipc.timestamp_eof
-
+from collections import deque
 class ModelState:
   frames: dict[str, DrivingModelFrame]
   inputs: dict[str, np.ndarray]
@@ -406,12 +330,15 @@ class ModelState:
     self.full_desire = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.DESIRE_LEN), dtype=np.float32)
     self.full_prev_desired_curv = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.PREV_DESIRED_CURV_LEN), dtype=np.float32)
     self.temporal_idxs = slice(-1-(ModelConstants.TEMPORAL_SKIP*(ModelConstants.INPUT_HISTORY_BUFFER_LEN-1)), None, ModelConstants.TEMPORAL_SKIP)
-    self.dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+    self.dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CPUExecutionProvider"])
 
     # self.dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
     self.pytorch_vision_model_loaded = pytorch_vision_model_loaded
     self.pytorch_policy_model_loaded = pytorch_policy_model_loaded
     self.logger = PolicyLogger(Path("policy_logger"), batch=256)
+    self.dr_cv_history = deque(maxlen=100)  # adjust length as needed
+    self.md_cv_history = deque(maxlen=100)
+    self.plot_initialized = False
 
     with open(VISION_METADATA_PATH, 'rb') as f:
       vision_metadata = pickle.load(f)
@@ -491,22 +418,10 @@ class ModelState:
           np_arr = tensor
       assert np_arr.dtype == np.uint8, f"{key} is {np_arr.dtype}, expected uint8"
       onnx_feed[key] = np_arr
-      torch_tensor = torch.from_numpy(np_arr).to(device)
-
-      torch_feed[key] = torch_tensor                              # add to dict
-      image_feed[key] = show_two_yuv_combined(np_arr)
-
-    # show_all_feeds(image_feed)
 
     onnx_outputs = self.dv_onnx.run(None, onnx_feed)
 
-
-    # with torch.inference_mode():
-    #   pytorch_outputs = self.pytorch_vision_model_loaded(**torch_feed)
-    # pytorch_outputs = [out.detach().cpu().numpy() for out in pytorch_outputs]
-
     output_array = onnx_outputs[0].reshape(-1)
-    model_len_v    = output_array.shape[0]
 
     vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(output_array, self.vision_output_slices))
     self.full_features_buffer[0,:-1] = self.full_features_buffer[0,1:]
@@ -528,45 +443,8 @@ class ModelState:
     # assert torch.allclose(pytorch_p_outputs, model_test_output, atol=1e-5)
     pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
 
-
-
-    # # print(self.policy_output_slices)
-
-
-    # PLAN_FLOATS      = 4_955           # total floats in "plan"
-    # FLOATS_PER_TRAJ  = 991             # 33 × 15 × 2  + 1
-    # IDX_N, WIDTH     = 33, 15
-    # # DESIRED_CURV_SL = slice(5880, 5882)
-
-
-    # # ── 1.  Unpack the plan head --------------------------------------
-    # flat_policy = pytorch_p_outputs[0]        # numpy.ndarray
-    # flat_policy = np.asarray(flat_policy).reshape(-1)   # shape (≈6 k,)
-    # plan_raw = flat_policy[:PLAN_FLOATS].reshape(5, FLOATS_PER_TRAJ)
-    # mu   = plan_raw[:, :495].reshape(5, IDX_N, WIDTH)   # (5, 33, 15)
-    # logits = plan_raw[:, 990]
-
-    # best = int(np.argmax(softmax(logits)))              # 0 … 4
-
-    # # ── 2.  Replace μ_x and μ_y for that best hypothesis --------------
-    # mu[best, :, 0] = inputs['x']      # channel 0 → x_pos
-    # mu[best, :, 1] = inputs['y']      # channel 1 → y_pos
-    # # (you can also patch more channels here if desired)
-
-    # # ── 3.  Re-flatten and copy back into the big vector --------------
-    # plan_raw[:, :495] = mu.reshape(5, 495)              # pack μ+σ block
-    # flat_policy[:PLAN_FLOATS] = plan_raw.reshape(-1)    # overwrite slice
-
-    # # ── 4.  If the rest of your code still uses `pytorch_p_outputs`,
-    # #        update the list element in place so everyone sees the edit
-    # flat_policy[5880] = inputs['dr_cv']
-    # pytorch_p_outputs[0][...] = flat_policy             # in-place update
-    # # if inputs['save']:
-    # #   print('Save')
-    # #   self.logger.add(torch_policy_inputs, pytorch_p_outputs)
-
-
     if inputs['save']:
+      print('Take over')
       self.policy_ouput = nav_onnx_output
     else:
        self.policy_ouput = pytorch_p_outputs
@@ -577,51 +455,29 @@ class ModelState:
 
     print(f"dr_cv:{inputs['dr_cv']}")
     print(f"MD_cv:{policy_outputs_dict['desired_curvature']}")
+    # self.dr_cv_history.append(inputs['dr_cv'])
+    # self.md_cv_history.append(policy_outputs_dict['desired_curvature'][0])  # assuming it's a scalar
 
+
+    # if not self.plot_initialized:
+    #    plt.ion()
+    #    self.fig,self.ax = plt.subplots()
+    #    self.line1, = self.ax.plot([],[],label = 'dr_cv', color='blue')
+    #    self.line2, = self.ax.plot([],[],label = 'MD_cv',color = 'red')
+    #    self.ax.set_xlim(0,len(self.dr_cv_history))
+    #    self.ax.set_ylim(-0.13,0.13)
+    #    self.ax.legend()
+    #    self.plot_initialized = True
+
+    # self.line1.set_data(range(len(self.dr_cv_history)),list(self.dr_cv_history))
+    # self.line2.set_data(range(len(self.md_cv_history)),list(self.md_cv_history))
+    # self.ax.set_xlim(0, len(self.dr_cv_history))
+    # self.ax.relim()
+    # self.ax.autoscale_view(True,True,True)
+    # self.fig.canvas.draw()
+    # self.fig.canvas.flush_events()
 
     return combined_outputs_dict,image_feed
-
-from collections import namedtuple
-def bgr_to_nv12_buf(bgr: np.ndarray) -> VisionBuf:
-    """
-    Convert a BGR image to an NV12 raw buffer packed into a VisionBuf-like namedtuple.
-    """
-    h, w = bgr.shape[:2]
-    # NV12 expects stride = width (you may need to pad to alignment in real use)
-    stride = w
-    uv_offset = h * stride
-
-    # 2. Convert BGR → YUV420p (I420 planar) via OpenCV
-    #    This gives a flat array: [Y plane (h*w), U plane (h/2*w/2), V plane (h/2*w/2)]
-    yuv_i420 = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420).flatten()
-
-    # 3. Extract Y, U, V planes
-    y_size = h * w
-    uv_half_size = (h // 2) * (w // 2)
-    y_plane = yuv_i420[0 : y_size].reshape((h, w))
-    u_plane = yuv_i420[y_size : y_size + uv_half_size].reshape((h // 2, w // 2))
-    v_plane = yuv_i420[y_size + uv_half_size : y_size + 2*uv_half_size].reshape((h // 2, w // 2))
-
-    # 4. Build the interleaved UV plane for NV12 (semi-planar):
-    #    for each row r, each column c: uv_row[2*c] = U[r,c], uv_row[2*c+1] = V[r,c]
-    uv_plane = np.empty((h // 2, w), dtype=np.uint8)
-    uv_plane[:, 0::2] = u_plane
-    uv_plane[:, 1::2] = v_plane
-
-    # 5. Stack Y and UV into one NV12 buffer (shape (h + h/2, w))
-    nv12 = np.vstack((y_plane, uv_plane))
-
-    # 6. Package into VisionBuf: .data should be bytes or a buffer object
-    return VisionBuf(
-        data=nv12.tobytes(),
-        height=h,
-        width=w,
-        stride=stride,
-        uv_offset=uv_offset
-    )
-
-
-
 
 
 def main(demo=False):
@@ -694,18 +550,7 @@ def main(demo=False):
   buf_main, buf_extra = None, None
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
-  # print('sub_all_msg')
 
-
-  # if demo:
-  #   CP = get_demo_car_params()
-  # else:
-  #   # print('sub_all_msg')
-  #   CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
-  # cloudlog.info("modeld got CarParams: %s", CP.brand)
-
-  # TODO this needs more thought, use .2s extra for now to estimate other delays
-  # TODO Move smooth seconds to action function
   long_delay = 0.15000000596046448 + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
@@ -758,83 +603,24 @@ def main(demo=False):
     lat, lon, _ = g.positionGeodetic.value
     live_lats.append(lat); live_lons.append(lon)
 
-    # bearing
-    if g.velocityNED.valid:
-        bearing = horiz_speed_bearing(g.velocityNED.value)
-    elif len(live_lats) > 1:
-        _gx, _gy = equirect(np.array(live_lats[-2:]),
-                            np.array(live_lons[-2:]),
-                            origin_lat, origin_lon)
-        dx, dy = _gx[-1]-_gx[-2], _gy[-1]-_gy[-2]
-        bearing = np.arctan2(dx, dy) if (dx or dy) else 0.0
-    else:
-        bearing = 0.0
-
     # look-ahead slice
     dists = haversine(route_lats, route_lons, lat, lon)
     idx   = int(np.argmin(dists))
-    nxt_lat = route_lats[idx:idx+args.n] if dists[idx] < args.thresh else np.array([])
-    nxt_lon = route_lons[idx:idx+args.n] if dists[idx] < args.thresh else np.array([])
+
     desire_cur = route_d_cur[idx+1]
-    # print(f'GT_desire_cur:{desire_cur}')
-
-    # planar projection
-    gx,  gy  = equirect(np.asarray(live_lats), np.asarray(live_lons),
-                        origin_lat, origin_lon)
-    grx, gry = equirect(route_lats, route_lons, origin_lat, origin_lon)
-    gxp, gyp = equirect(nxt_lat, nxt_lon, origin_lat, origin_lon)
-
-    # translate so car at (0,0)
-    tx, ty = gx[-1], gy[-1]
-    gx  -= tx; gy  -= ty
-    grx -= tx; gry -= ty
-    gxp -= tx; gyp -= ty
-
-    # rotate to heading-up
-    x,  y  = rotate(gx,  gy,  -bearing)
-    rx, ry = rotate(grx, gry, -bearing)
-    xp, yp = rotate(gxp, gyp, -bearing) if len(gxp) else (np.array([]), np.array([]))
-
-
-    route_line.set_data(rx, ry)
-    # pred_line .set_data(xp, yp)
-    curr_pt   .set_data([0], [0])
-    heading_q .set_offsets([[0, 0]]); heading_q.set_UVC([0], [10])
-
-    ax.set_xlim(-W, W); ax.set_ylim(-W, W)
-    ax.set_title(f"Fixes {len(live_lats)} | match {dists[idx]:.1f} m")
-
-    fig.canvas.draw_idle()       # schedule a redraw
-    fig.canvas.flush_events()    # actually push to the screen
-    # plt.pause(0.001)
 
 
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
-    # print(sm["navInstruction"])
-    # print(sm["navModelDEPRECATED"])
-    # print(sm["liveLocationKalmanDEPRECATED"].positionGeodetic)
-    # print(sm["liveLocationKalmanDEPRECATED"].positionECEF)
-    next_maneuver = {
-      'type': sm["navInstruction"].maneuverType,
-      'modifier': sm["navInstruction"].maneuverModifier,
-      'street': sm["navInstruction"].maneuverPrimaryText,
-      'distance': sm["navInstruction"].maneuverDistance
-    }
 
-    # Displaying the next maneuver
     save_flat = False
     # if next_maneuver['distance'] != 0:
     #  print(f"Next maneuver: {next_maneuver['type']} {next_maneuver['modifier']} onto {next_maneuver['street']} in {next_maneuver['distance']:.2f} meters. desire_:{1/(4*next_maneuver['distance']/(2*np.pi))}")
     if sm["navInstruction"].maneuverDistance <25 and sm["navInstruction"].maneuverDistance > -5 and  sm["navInstruction"].maneuverType == 'turn':
        save_flat = True
     lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
-    # cloudlog.warning(f'steeringAngleDeg:{sm["carState"].steeringAngleDeg}')
-    # cloudlog.warning(f'steeringTorque:{sm["carState"].steeringTorque}')
-    # cloudlog.warning(f'steeringPressed:{sm["carState"].steeringPressed}')
-    # cloudlog.warning(f'Model_desire_curv:{sm["modelV2"].action.desiredCurvature}')
     lateral_control_params = np.array([v_ego, lat_delay], dtype=np.float32)
     if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib, dtype=np.float32)
@@ -842,51 +628,11 @@ def main(demo=False):
       # print(f'dc:{dc}')
       model_transform_main = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics, False).astype(np.float32)
       model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics, True).astype(np.float32)
-      # model_transform_extra = np.array([
-      #     [2 , 0,   6.00883545e+02    ],
-      #     [0, 2 ,   3.62377625e+02     ],
-      #     [0, 0, 1]
-      # ], dtype=np.float32)
       live_calib_seen = True
 
     traffic_convention = np.zeros(2)
     traffic_convention[int(is_rhd)] = 1
-    H = model_transform_extra  # shape (3,3), dtype float32
-    t_idxs = np.array(ModelConstants.T_IDXS, dtype=np.float32)
 
-
-    theta  = -np.pi/2                          # –90 degrees in radians
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
-    R = np.array([[ cos_t, -sin_t],
-                  [ sin_t,  cos_t]], dtype=np.float32)
-
-    def draw_model_path(canvas, x_coeffs, y_coeffs):
-        h, w = canvas.shape[:2]
-        bottom_center = np.array([w//2, h-1], dtype=np.float32)
-
-        # 1) Evaluate in model-frame
-        xs = polyval(t_idxs, x_coeffs)
-        ys = polyval(t_idxs, y_coeffs)
-        # print(max(xs))
-        # print(max(ys))
-        # 2) Project through homography
-        pts_model = np.stack([xs, ys, np.ones_like(xs)], axis=0)  # (3,N)
-        pts_img   = H.dot(pts_model)                              # (3,N)
-        pts_img  /= pts_img[2:3, :]                               # normalize
-        pts2d     = pts_img[:2, :].T                              # (N,2)
-
-        # 3) Shift so first point is at bottom-center
-        shift = bottom_center - pts2d[0]
-        pts2d = pts2d + shift
-
-        # 4) Rotate all points by –90° about bottom-center
-        centered = pts2d - bottom_center      # (N,2)
-        rotated  = (R @ centered.T).T         # (N,2)
-        pts2d_rot = rotated + bottom_center   # (N,2)
-
-        # 5) Draw
-        pts_int = pts2d_rot.reshape(-1,1,2).astype(np.int32)
-        cv2.polylines(canvas, [pts_int], isClosed=False, color=(0,255,0), thickness=2)
     vec_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
     if desire >= 0 and desire < ModelConstants.DESIRE_LEN:
       vec_desire[desire] = 1
@@ -923,41 +669,12 @@ def main(demo=False):
         if 0 <= distance_idx < 50:
           nav_instructions[distance_idx*3 + direction_idx] = 1
 
-    xp_r, yp_r = resample_xy_to_t(xp.astype(float),
-                                    yp.astype(float),
-                                    t_tmp)
-    try:
-        # Savitzky–Golay: odd window, poly-order < window
-        from scipy.signal import savgol_filter
 
-        win = 9                       # experiment: 5-9 points work well for 33-pt path
-        win = win | 1                 # make sure it’s odd
-        if len(t_tmp) < win:          # short safety
-            win = len(t_tmp) | 1
-
-        poly = 3                      # cubic fits most OP paths
-        xp_smooth = savgol_filter(xp_r, win, poly)
-        yp_smooth = savgol_filter(yp_r, win, poly)
-        # print(xp_r)
-        # print(yp_r)
-
-    except ImportError:
-      # Fallback: centred moving average (very light smoothing)
-      k = 5                         # window size
-      kernel = np.ones(k, dtype=float) / k
-      xp_smooth = np.convolve(xp_r, kernel, mode='same')
-      yp_smooth = np.convolve(yp_r, kernel, mode='same')
-
-    xp     = yp_smooth.astype(float).tolist()       # forward → x
-    yp     = xp_smooth.astype(float).tolist()
-    pred_line .set_data(yp, xp)
 
     inputs:dict[str, np.ndarray] = {
       'desire': vec_desire,
       'traffic_convention': traffic_convention,
       'lateral_control_params': lateral_control_params,
-      'x':xp,
-      'y':yp,
       'dr_cv':desire_cur,
       'save':save_flat,
       'nav_features': nav_features,
@@ -973,73 +690,12 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-      # print(model_output['desired_curvature'][0][0])
 
-      # cloudlog.warning(1/model_output['desired_curvature'][0][0])
-      # cloudlog.warning(model_output['lane_lines_prob'])
-      # if model_output['desired_curvature'][0][0]>0.03:
-      #   model_output['desired_curvature'][0][0] = 0.01
       action = get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, long_delay + DT_MDL, v_ego,sm["navInstruction"].maneuverDistance)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
-      # print(modelv2_send.modelV2.position)
-
-
-      i = 9
-      m_x = np.array(modelv2_send.modelV2.position.x)
-      m_y = np.array(modelv2_send.modelV2.position.y)
-      x0,x1,x2 = m_x[i-1:i+2]
-      y0,y1,y2 = m_y[i-1:i+2]
-      dx = x2-x0
-      y_p = (y2-y0)/dx
-      h = dx/2
-      y_pp = (y2 - 2*y1 + y0)/h**2
-      d_c = y_pp/(1+y_p**2)**1.5
-      # print(f"es_dc:{d_c}")
-      if len(modelv2_send.modelV2.position.x):
-            fwd  = np.array(modelv2_send.modelV2.position.x)        # forward (X) ➜ +Y after swap
-            left = np.array(modelv2_send.modelV2.position.y)        # left (Y) ➜ +X after swap
-            mdl_x, mdl_y = left, fwd
-            model_line.set_data(mdl_x, mdl_y)
-      # tgrid = np.array(modelv2_send.modelV2.position.t)     # 33-pt grid
-
-      # xp_r, yp_r = resample_xy_to_t(xp.astype(float),
-      #                               yp.astype(float),
-      #                               tgrid)
-
-      # try:
-      #   from scipy.signal import savgol_filter
-
-      #   win = 9                       # experiment: 5-9 points work well for 33-pt path
-      #   win = win | 1                 # make sure it’s odd
-      #   if len(tgrid) < win:          # short safety
-      #       win = len(tgrid) | 1
-      #   poly = 3                      # cubic fits most OP paths
-      #   xp_smooth = savgol_filter(xp_r, win, poly)
-      #   yp_smooth = savgol_filter(yp_r, win, poly)
-
-      # except ImportError:
-      #   k = 5
-      #   kernel = np.ones(k, dtype=float) / k
-      #   xp_smooth = np.convolve(xp_r, kernel, mode='same')
-      #   yp_smooth = np.convolve(yp_r, kernel, mode='same')
-
-      # pos = modelv2_send.modelV2.position           # shortcut
-      # # print(f'pos_x:{pos.x}')
-      # print(f'velocity:{modelv2_send.modelV2.velocity}')
-      # print(f'acceleration:{modelv2_send.modelV2.acceleration}')
-      # print(f'pos:{pos}')
-
-      # pos.x     = yp_smooth.astype(float).tolist()       # forward → x
-      # pos.y     = xp_smooth.astype(float).tolist()       # left    → y
-      # pos.xStd  = [0.05] * len(tgrid)
-      # pos.yStd  = [0.05] * len(tgrid)
-
-
-
-
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
