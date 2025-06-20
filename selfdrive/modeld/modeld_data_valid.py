@@ -13,7 +13,8 @@ USBGPU = "USBGPU" in os.environ
 # else:
 #   os.environ['LLVM'] = '1'
 #   os.environ['JIT'] = '2'
-from tinygrad_repo.tinygrad.tensor import Tensor
+# from tinygrad_repo.tinygrad
+from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 import torch
 import time
@@ -55,7 +56,7 @@ from scipy.special import softmax
 
 
 ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-ap.add_argument("--route",  type=Path, default="/home/adas/openpilot/kalman_track_CS_2025-06-17_14-38-58.csv",
+ap.add_argument("--route",  type=Path, default="/home/adas/openpilot/kalman_track_CS_2025-06-20_15-02-14.csv",
                 help="reference path (.csv or .rlog.bz2)")
 ap.add_argument("--thresh", type=float, default=20,  help="match threshold (m)")
 ap.add_argument("--n",      type=int,   default=100,  help="# future points to plot")
@@ -428,26 +429,24 @@ class ModelState:
     self.full_features_buffer[0,-1] = vision_outputs_dict['hidden_state'][0, :]
     self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
 
-    torch_policy_inputs = {
-      name: torch.from_numpy(arr).to(device).to(torch.float16)
-      for name, arr in self.numpy_inputs.items()
-    }
-    onnx_policy_input = {
-       name: arr.astype(np.float32,copy=False)
-       for name,arr in self.numpy_inputs.items()
-    }
-    nav_onnx_output = nav_onnx.run(None,onnx_policy_input)
-    with torch.inference_mode():
-      pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
-      # model_test_output = model_test(**torch_policy_inputs)
-    # assert torch.allclose(pytorch_p_outputs, model_test_output, atol=1e-5)
-    pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
-
     if inputs['save']:
+      onnx_policy_input = {
+        name: arr.astype(np.float32,copy=False)
+        for name,arr in self.numpy_inputs.items()
+      }
       print('Take over')
+      nav_onnx_output = nav_onnx.run(None,onnx_policy_input)
       self.policy_ouput = nav_onnx_output
     else:
-       self.policy_ouput = pytorch_p_outputs
+      torch_policy_inputs = {
+        name: torch.from_numpy(arr).to(device).to(torch.float16)
+        for name, arr in self.numpy_inputs.items()
+      }
+      with torch.inference_mode():
+        pytorch_p_outputs = self.pytorch_policy_model_loaded(**torch_policy_inputs)
+
+      pytorch_p_outputs = [out.detach().cpu().numpy() for out in pytorch_p_outputs]
+      self.policy_ouput = pytorch_p_outputs
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices))
     tmp = self.slice_outputs(self.policy_ouput[0].reshape(-1), self.policy_output_slices)
     # print(tmp['desired_curvature'])
