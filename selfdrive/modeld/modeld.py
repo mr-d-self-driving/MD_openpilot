@@ -13,6 +13,7 @@ USBGPU = "USBGPU" in os.environ
 # else:
 #   os.environ['LLVM'] = '1'
 #   os.environ['JIT'] = '2'
+import pathlib
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 import torch
@@ -55,8 +56,8 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 VISION_ONNX_PATH = Path(__file__).parent / 'models/driving_vision.onnx'
 POLICY_ONNX_PATH = Path(__file__).parent / 'models/driving_policy.onnx'
-VISION_PKL_PATH = Path(__file__).parent / 'models/driving_vision_tinygrad.pkl'
-POLICY_PKL_PATH = Path(__file__).parent / 'models/driving_policy_tinygrad.pkl'
+VISION_PKL_PATH = Path(__file__).parent / 'models/driving_vision.pkl'
+POLICY_PKL_PATH = Path(__file__).parent / 'models/driving_policy.pkl'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
 
@@ -80,21 +81,21 @@ pytorch_policy_model_loaded.requires_grad_(False)
 pytorch_policy_model_loaded.eval()
 
 
-model_path = "/home/adas/openpilot/selfdrive/modeld/models/driving_vision.onnx"
-runner      = OnnxRunner(onnx.load(model_path))       # runner is already callable
+# model_path = "/home/adas/openpilot/selfdrive/modeld/models/driving_vision_clean.onnx"
+# runner      = OnnxRunner(onnx.load(model_path))       # runner is already callable
 
-# --- hydrate weights -------------------------------------------------------
-with open("/home/adas/openpilot/selfdrive/modeld/models/driving_vision_tinygrad.pkl", "rb") as f:
-    saved_state = pickle.load(f)
-load_state_dict(runner, saved_state)
+# # --- hydrate weights -------------------------------------------------------
+# with open("/home/adas/openpilot/selfdrive/modeld/models/driving_vision_tinygrad.pkl", "rb") as f:
+#     saved_state = pickle.load(f)
+# load_state_dict(runner, saved_state)
 
-model_path = "/home/adas/openpilot/selfdrive/modeld/models/driving_policy.onnx"
-p_runner      = OnnxRunner(onnx.load(model_path))       # runner is already callable
+# model_path = "/home/adas/openpilot/selfdrive/modeld/models/driving_policy.onnx"
+# p_runner      = OnnxRunner(onnx.load(model_path))       # runner is already callable
 
-# --- hydrate weights -------------------------------------------------------
-with open("/home/adas/openpilot/selfdrive/modeld/models/driving_policy_tinygrad.pkl", "rb") as f:
-    saved_state = pickle.load(f)
-load_state_dict(p_runner, saved_state)
+# # --- hydrate weights -------------------------------------------------------
+# with open("/home/adas/openpilot/selfdrive/modeld/models/driving_policy_tinygrad.pkl", "rb") as f:
+#     saved_state = pickle.load(f)
+# load_state_dict(p_runner, saved_state)
 # state_dict = torch.load(ckpt_path, map_location=device)
 # pytorch_model_loaded.load_state_dict(state_dict, strict=True)
 
@@ -105,10 +106,11 @@ MIN_LAT_CONTROL_SPEED = 0.3
 save_dir = "./saved_frames"
 os.makedirs(save_dir, exist_ok=True)
 
-
-def vision_run(**inputs):
-    # OpenPilot expects the first (and only) output flattened
-    return runner(**inputs)[0]
+from tinygrad import TinyJit
+# @TinyJit
+# def vision_run(inputs):
+#     # OpenPilot expects the first (and only) output flattened
+#     return runner(inputs)['outputs']
 
 def b(a):
     k = 0.01
@@ -127,7 +129,7 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                                      action_t=long_action_t)
     desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
     desired_curvature = model_output['desired_curvature'][0, 0]
-    # print(f'model_desired_curvature:{desired_curvature}')
+    print(f'model_desired_curvature:{desired_curvature}')
     # desired_curvature = max(min(model_output['desired_curvature'][0, 0],0.1),-0.1)
     if distance < 20:
       desired_curvature = 0.1
@@ -142,59 +144,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                   desiredAcceleration=float(desired_accel),
                                   shouldStop=bool(should_stop))
 import matplotlib.pyplot as plt
-def show_two_yuv_combined(raw: np.ndarray):
-    """
-    raw: uint8 array of shape (1,12,128,256)
-    Decodes two YUV frames, stacks them horizontally, and displays in one window.
-    """
-    # 1) Remove batch and split into two 6-channel frames
-    arr    = raw.squeeze(0)               # → (12,128,256)
-    frames = arr.reshape(2, 6, 128, 256)  # → (2,6,128,256)
-
-    bgr_frames = []
-    for f in frames:
-        # Rebuild full-res Y
-        Y = np.zeros((256, 512), dtype=np.uint8)
-        Y[0::2,0::2] = f[0]; Y[0::2,1::2] = f[1]
-        Y[1::2,0::2] = f[2]; Y[1::2,1::2] = f[3]
-        # Upsample U/V
-        U = cv2.resize(f[4], (512,256), interpolation=cv2.INTER_LINEAR)
-        V = cv2.resize(f[5], (512,256), interpolation=cv2.INTER_LINEAR)
-        # Stack & convert
-        yuv = np.stack((Y, U, V), axis=-1)
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
-        bgr_frames.append(bgr)
-        # bgr_frames = bgr
-
-    # 2) Combine horizontally: result shape = (256, 512*2, 3)
-    combined = np.hstack(bgr_frames)
-
-    return combined
-
-def show_all_feeds(image_feed: dict):
-    """
-    image_feed: dict[key -> BGR numpy array of shape (256, 1024, 3)]
-    Stacks them vertically and shows in one window.
-    """
-    # make sure we have at least one feed
-    if not image_feed:
-        return
-
-    # grab the list of arrays in insertion order
-    frames = list(image_feed.values())
-
-    # verify they all have the same width and channels
-    h, w, c = frames[0].shape
-    for f in frames:
-        assert f.shape[1] == w and f.shape[2] == c, "All feeds must have same width & channels"
-
-    # stack vertically into shape (256 * N, 1024, 3)
-    canvas = np.vstack(frames)
-
-    cv2.imshow("All Feeds", canvas)
-    # if cv2.waitKey(1) & 0xFF == ord('q'):
-    #     return
-
 
 class FrameMeta:
   frame_id: int = 0
@@ -225,11 +174,11 @@ class ModelState:
     self.full_desire = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.DESIRE_LEN), dtype=np.float32)
     self.full_prev_desired_curv = np.zeros((1, ModelConstants.FULL_HISTORY_BUFFER_LEN, ModelConstants.PREV_DESIRED_CURV_LEN), dtype=np.float32)
     self.temporal_idxs = slice(-1-(ModelConstants.TEMPORAL_SKIP*(ModelConstants.INPUT_HISTORY_BUFFER_LEN-1)), None, ModelConstants.TEMPORAL_SKIP)
-    self.dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+    # self.dv_onnx = ort.InferenceSession(VISION_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
 
     # self.dp_onnx = ort.InferenceSession(POLICY_ONNX_PATH, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
-    self.pytorch_vision_model_loaded = pytorch_vision_model_loaded
-    self.pytorch_policy_model_loaded = pytorch_policy_model_loaded
+    # self.pytorch_vision_model_loaded = pytorch_vision_model_loaded
+    # self.pytorch_policy_model_loaded = pytorch_policy_model_loaded
 
     with open(VISION_METADATA_PATH, 'rb') as f:
       vision_metadata = pickle.load(f)
@@ -259,7 +208,7 @@ class ModelState:
       'prev_desired_curv': np.zeros((1, ModelConstants.INPUT_HISTORY_BUFFER_LEN, ModelConstants.PREV_DESIRED_CURV_LEN), dtype=np.float32),
       'features_buffer': np.zeros((1, ModelConstants.INPUT_HISTORY_BUFFER_LEN,  ModelConstants.FEATURE_LEN), dtype=np.float32),
     }
-    self.policy_inputs = {k: Tensor(v, device='cuda').realize() for k,v in self.numpy_inputs.items()}
+    self.policy_inputs = {k: Tensor(v, device='NPY').realize() for k,v in self.numpy_inputs.items()}
     self.policy_output = np.zeros(policy_output_size, dtype=np.float32)
     self.parser = Parser()
 
@@ -268,86 +217,9 @@ class ModelState:
     parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
     return parsed_model_outputs
 
-  def slice_len(self,model_len,sl):
-    if isinstance(sl, slice):
-        # Pythonic interpretation of slice.start / slice.stop
-        start = sl.start if sl.start is not None else 0
-        if start < 0:
-            start += model_len
-        stop  = sl.stop  if sl.stop  is not None else model_len
-        if stop  < 0:
-            stop  += model_len
-        return max(stop - start, 0)
-    else:
-        return len(sl)
 
-  # def run(self, buf: VisionBuf, wbuf: VisionBuf, transform: np.ndarray, transform_wide: np.ndarray,
-  #               inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray] | None:
-
-  #   inputs['desire'][0] = 0
-  #   new_desire = np.where(inputs['desire'] - self.prev_desire > .99, inputs['desire'], 0)
-  #   self.prev_desire[:] = inputs['desire']
-  #   self.full_desire[0,:-1] = self.full_desire[0,1:]
-  #   self.full_desire[0,-1] = new_desire
-  #   # print(f'new_desire:{new_desire}')
-  #   self.numpy_inputs['desire'][:] = self.full_desire.reshape((1,ModelConstants.INPUT_HISTORY_BUFFER_LEN,ModelConstants.TEMPORAL_SKIP,-1)).max(axis=2)
-  #   # print(self.numpy_inputs['desire'][:])
-  #   self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
-  #   self.numpy_inputs['lateral_control_params'][:] = inputs['lateral_control_params']
-  #   onnx_feed = {}
-  #   image_feed = {}
-
-  #   imgs_cl = {'input_imgs': self.frames['input_imgs'].prepare(buf, transform.flatten()),
-  #              'big_input_imgs': self.frames['big_input_imgs'].prepare(wbuf, transform_wide.flatten())}
-
-  #   for key in imgs_cl:
-  #     frame_input = self.frames[key].buffer_from_cl(imgs_cl[key]).reshape(self.vision_input_shapes[key])
-  #     self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8).realize()
-
-  #     tensor = self.vision_inputs[key]
-  #     if isinstance(tensor, Tensor):
-  #         np_arr = tensor.numpy()
-  #     else:
-  #         np_arr = tensor
-  #     assert np_arr.dtype == np.uint8, f"{key} is {np_arr.dtype}, expected uint8"
-  #     onnx_feed[key] = np_arr
-
-  #   self.vision_output = runner(onnx_feed)
-
-
-  #   output_array = self.vision_output['outputs'].numpy().flatten()
-
-  #   vision_outputs_dict = self.parser.parse_vision_outputs(self.slice_outputs(output_array, self.vision_output_slices))
-  #   self.full_features_buffer[0,:-1] = self.full_features_buffer[0,1:]
-  #   self.full_features_buffer[0,-1] = vision_outputs_dict['hidden_state'][0, :]
-  #   self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
-
-  #   onnx_policy_input = {
-  #      name: arr.astype(np.float32,copy=False)
-  #      for name,arr in self.numpy_inputs.items()
-  #   }
-  #   p_runner_output = p_runner(onnx_policy_input)
-  #   self.policy_output = p_runner_output['outputs'].numpy().flatten()
-
-
-  #   policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_output, self.policy_output_slices))
-  #   combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
-  #   # print(policy_outputs_dict.keys())
-  #   return combined_outputs_dict,image_feed
-
-  # ---------------------------------------------------------------------------
-#  Fast, crash-free run() – tinygrad + ONNX + OpenPilot (June 2025)
-# ---------------------------------------------------------------------------
-  def run(
-      self,
-      buf: VisionBuf,
-      wbuf: VisionBuf,
-      transform: np.ndarray,
-      transform_wide: np.ndarray,
-      inputs: dict[str, np.ndarray],
-  ) -> tuple[dict[str, np.ndarray], dict]:
-
-      # ─────────────── 1. update DESIRE history ───────────────────────────────
+  def run(self, buf: VisionBuf, wbuf: VisionBuf, transform: np.ndarray, transform_wide: np.ndarray,
+                inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray] | None:
       new_desire                  = np.where(inputs["desire"] - self.prev_desire > 0.99,
                                             inputs["desire"], 0)
       self.prev_desire[:]         = inputs["desire"]
@@ -360,86 +232,31 @@ class ModelState:
       self.numpy_inputs["traffic_convention"][:]   = inputs["traffic_convention"]
       self.numpy_inputs["lateral_control_params"][:] = inputs["lateral_control_params"]
 
-      # ─────────────── 2. prepare GPU image tensors ───────────────────────────
       imgs_cl = {'input_imgs': self.frames['input_imgs'].prepare(buf, transform.flatten()),
                 'big_input_imgs': self.frames['big_input_imgs'].prepare(wbuf, transform_wide.flatten())}
 
       for key in imgs_cl:
         frame_input = self.frames[key].buffer_from_cl(imgs_cl[key]).reshape(self.vision_input_shapes[key])
-        self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8).realize()
+        self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8,  device='GPU').realize()
 
-      # ─────────────── 3. VISION forward pass ────────────────────────────────
-      vision_out  = runner(self.vision_inputs)["outputs"]     # Tensor on GPU
-      vision_flat = vision_out.to("cpu").numpy().ravel()      # one host hop
+      vision_out = self.vision_run(**self.vision_inputs).numpy().ravel()
 
       vision_dict = self.parser.parse_vision_outputs(
-          self.slice_outputs(vision_flat, self.vision_output_slices)
+          self.slice_outputs(vision_out, self.vision_output_slices)
       )
 
-      # ─────────────── 4. assemble POLICY inputs ─────────────────────────────
       self.full_features_buffer[0, :-1] = self.full_features_buffer[0, 1:]
       self.full_features_buffer[0, -1]  = vision_dict["hidden_state"][0]
       self.numpy_inputs["features_buffer"][:] = \
           self.full_features_buffer[0, self.temporal_idxs]
 
-      policy_inputs = {
-          name: arr.astype(np.float32, copy=False)
-          for name, arr in self.numpy_inputs.items()
-      }
-
-      # ─────────────── 5. POLICY forward pass ────────────────────────────────
-      policy_out   = p_runner(policy_inputs)["outputs"]        # Tensor
-      policy_flat  = policy_out.to("cpu").numpy().ravel()
+      policy_out   = self.policy_run(**self.policy_inputs).numpy().ravel()
 
       policy_dict = self.parser.parse_policy_outputs(
-          self.slice_outputs(policy_flat, self.policy_output_slices)
+          self.slice_outputs(policy_out, self.policy_output_slices)
       )
 
-      # ─────────────── 6. done ───────────────────────────────────────────────
       return {**vision_dict, **policy_dict}, {}
-
-
-from collections import namedtuple
-def bgr_to_nv12_buf(bgr: np.ndarray) -> VisionBuf:
-    """
-    Convert a BGR image to an NV12 raw buffer packed into a VisionBuf-like namedtuple.
-    """
-    h, w = bgr.shape[:2]
-    # NV12 expects stride = width (you may need to pad to alignment in real use)
-    stride = w
-    uv_offset = h * stride
-
-    # 2. Convert BGR → YUV420p (I420 planar) via OpenCV
-    #    This gives a flat array: [Y plane (h*w), U plane (h/2*w/2), V plane (h/2*w/2)]
-    yuv_i420 = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420).flatten()
-
-    # 3. Extract Y, U, V planes
-    y_size = h * w
-    uv_half_size = (h // 2) * (w // 2)
-    y_plane = yuv_i420[0 : y_size].reshape((h, w))
-    u_plane = yuv_i420[y_size : y_size + uv_half_size].reshape((h // 2, w // 2))
-    v_plane = yuv_i420[y_size + uv_half_size : y_size + 2*uv_half_size].reshape((h // 2, w // 2))
-
-    # 4. Build the interleaved UV plane for NV12 (semi-planar):
-    #    for each row r, each column c: uv_row[2*c] = U[r,c], uv_row[2*c+1] = V[r,c]
-    uv_plane = np.empty((h // 2, w), dtype=np.uint8)
-    uv_plane[:, 0::2] = u_plane
-    uv_plane[:, 1::2] = v_plane
-
-    # 5. Stack Y and UV into one NV12 buffer (shape (h + h/2, w))
-    nv12 = np.vstack((y_plane, uv_plane))
-
-    # 6. Package into VisionBuf: .data should be bytes or a buffer object
-    return VisionBuf(
-        data=nv12.tobytes(),
-        height=h,
-        width=w,
-        stride=stride,
-        uv_offset=uv_offset
-    )
-
-
-
 
 
 def main(demo=False):
@@ -524,7 +341,6 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
-  frame_idx = 0
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
@@ -534,12 +350,6 @@ def main(demo=False):
       # cloudlog.warning(f"VisionBuf attrs: {attrs}")
       if buf_main is None:
         break
-
-      # filename = os.path.join(save_dir, f"frame_{meta_main.timestamp_sof}.png")
-      # success = cv2.imwrite(filename, bgr)
-      # if not success:
-      #     print(f"Failed to write {filename}")
-      frame_idx += 1
 
 
     if buf_main is None:
@@ -650,10 +460,6 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-      cloudlog.warning(1/model_output['desired_curvature'][0][0])
-      cloudlog.warning(model_output['lane_lines_prob'])
-      # if model_output['desired_curvature'][0][0]>0.03:
-      #   model_output['desired_curvature'][0][0] = 0.01
       action = get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, long_delay + DT_MDL, v_ego,sm["navInstruction"].maneuverDistance)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
@@ -671,24 +477,13 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
-      # cloudlog.warning(f'modelv2_send:{modelv2_send}')
-      # cloudlog.warning(f'drivingdata_send:{drivingdata_send}')
-      # cloudlog.warning(f'posenet_send:{posenet_send}')
-      x_coef = drivingdata_send.drivingModelData.path.xCoefficients  # length 5 list
-      y_coef = drivingdata_send.drivingModelData.path.yCoefficients
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
-      # draw_model_path(canvas_feed['big_input_imgs'], x_coef, y_coef)
 
-    #   # show the result
-    #   cv2.imshow("All Feeds with Path", canvas_feed['big_input_imgs'])
-    #   if cv2.waitKey(1) & 0xFF == ord('q'):
-          # break
 
     last_vipc_frame_id = meta_main.frame_id
-    # if cv2.waitKey(1) & 0xFF == ord('q'):
-    #     break
+
 
 if __name__ == "__main__":
   try:
